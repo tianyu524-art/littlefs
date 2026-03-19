@@ -507,6 +507,14 @@ int lfs_unmount(lfs_t *lfs);
 // If removing a directory, the directory must be empty.
 // Returns a negative error code on failure.
 int lfs_remove(lfs_t *lfs, const char *path);
+
+// Debug helper used by tools such as the simulator to remove a duplicate
+// non-directory entry by its current metadata id from a directory.
+//
+// This is intended for repair workflows. The function is conservative and
+// fails if the requested id currently resolves as the normal path target.
+int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
+        const char *name, uint16_t id);
 #endif
 
 #ifndef LFS_READONLY
