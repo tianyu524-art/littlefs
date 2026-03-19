@@ -32,13 +32,13 @@
 #define SIM_ARGV_MAX 64
 #define SIM_READ_CHUNK 4096
 
-#define DEFAULT_BLOCK_SIZE      (128u * 1024u)
-#define DEFAULT_BLOCK_COUNT     256u
-#define DEFAULT_READ_SIZE       256u
-#define DEFAULT_PROG_SIZE       256u
-#define DEFAULT_CACHE_SIZE      1024u
-#define DEFAULT_LOOKAHEAD_SIZE  32u
-#define DEFAULT_BLOCK_CYCLES    500
+#define DEFAULT_BLOCK_SIZE      (256u * 1024u)
+#define DEFAULT_BLOCK_COUNT     416u
+#define DEFAULT_READ_SIZE       512u
+#define DEFAULT_PROG_SIZE       512u
+#define DEFAULT_CACHE_SIZE      512u
+#define DEFAULT_LOOKAHEAD_SIZE  4096u
+#define DEFAULT_BLOCK_CYCLES    -1
 
 typedef struct sim_storage_cfg {
     lfs_size_t read_size;
@@ -48,6 +48,7 @@ typedef struct sim_storage_cfg {
     lfs_size_t cache_size;
     lfs_size_t lookahead_size;
     int32_t block_cycles;
+    lfs_size_t compact_thresh;    
 } sim_storage_cfg_t;
 
 typedef struct cli_options {
@@ -473,6 +474,7 @@ static void storage_cfg_set_defaults(sim_storage_cfg_t *storage) {
     storage->cache_size = DEFAULT_CACHE_SIZE;
     storage->lookahead_size = DEFAULT_LOOKAHEAD_SIZE;
     storage->block_cycles = DEFAULT_BLOCK_CYCLES;
+    storage->compact_thresh = -1;
 }
 
 static void storage_cfg_apply_overrides(
@@ -814,6 +816,7 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->cfg.block_size = sim->storage.block_size;
     sim->cfg.block_count = sim->storage.block_count;
     sim->cfg.block_cycles = sim->storage.block_cycles;
+    sim->cfg.compact_thresh = sim->storage.compact_thresh;
     sim->cfg.cache_size = sim->storage.cache_size;
     sim->cfg.lookahead_size = sim->storage.lookahead_size;
     sim->cfg.read_buffer = sim->read_buffer;
