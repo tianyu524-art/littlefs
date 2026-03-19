@@ -32,13 +32,13 @@
 #define SIM_ARGV_MAX 64
 #define SIM_READ_CHUNK 4096
 
-#define DEFAULT_BLOCK_SIZE      (128u * 1024u)
-#define DEFAULT_BLOCK_COUNT     256u
-#define DEFAULT_READ_SIZE       256u
-#define DEFAULT_PROG_SIZE       256u
-#define DEFAULT_CACHE_SIZE      1024u
-#define DEFAULT_LOOKAHEAD_SIZE  32u
-#define DEFAULT_BLOCK_CYCLES    500
+#define DEFAULT_BLOCK_SIZE      (256u * 1024u)
+#define DEFAULT_BLOCK_COUNT     416u
+#define DEFAULT_READ_SIZE       512u
+#define DEFAULT_PROG_SIZE       512u
+#define DEFAULT_CACHE_SIZE      512u
+#define DEFAULT_LOOKAHEAD_SIZE  4096u
+#define DEFAULT_BLOCK_CYCLES    -1
 
 typedef struct sim_storage_cfg {
     lfs_size_t read_size;
