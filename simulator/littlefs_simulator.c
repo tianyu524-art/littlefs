@@ -2189,11 +2189,6 @@ static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
         return -1;
     }
 
-    int err = meta_dump_target(sim, path, block_only, parsed_only, stdout);
-    if (err) {
-        return err;
-    }
-
     if (export_name != NULL) {
         char export_path[SIM_PATH_MAX];
         resolve_export_path(export_name, path, export_path, sizeof(export_path));
@@ -2205,16 +2200,17 @@ static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
             return -1;
         }
 
-        err = meta_dump_target(sim, path, block_only, parsed_only, f);
+        int err = meta_dump_target(sim, path, block_only, parsed_only, f);
         fclose(f);
         if (err) {
             return err;
         }
 
         printf("meta-dump exported to %s\n", export_path);
+        return 0;
     }
 
-    return 0;
+    return meta_dump_target(sim, path, block_only, parsed_only, stdout);
 }
 
 static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *should_exit) {

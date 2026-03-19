@@ -15,20 +15,19 @@
 #include <windows.h>
 #endif
 
-int lfs_filebd_create(const struct lfs_config *cfg, const char *path,
+int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
         const struct lfs_filebd_config *bdcfg) {
-    LFS_FILEBD_TRACE("lfs_filebd_create(%p {.context=%p, "
-                ".read=%p, .prog=%p, .erase=%p, .sync=%p}, "
+    LFS_FILEBD_TRACE("lfs_filebd_createcfg(%p {.context=%p, "
+                ".read=%p, .prog=%p, .erase=%p, .sync=%p, "
+                ".read_size=%"PRIu32", .prog_size=%"PRIu32", "
+                ".block_size=%"PRIu32", .block_count=%"PRIu32"}, "
                 "\"%s\", "
-                "%p {.read_size=%"PRIu32", .prog_size=%"PRIu32", "
-                ".erase_size=%"PRIu32", .erase_count=%"PRIu32"})",
+                "%p {.erase_value=%"PRId32"})",
             (void*)cfg, cfg->context,
             (void*)(uintptr_t)cfg->read, (void*)(uintptr_t)cfg->prog,
             (void*)(uintptr_t)cfg->erase, (void*)(uintptr_t)cfg->sync,
-            path,
-            (void*)bdcfg,
-            bdcfg->read_size, bdcfg->prog_size, bdcfg->erase_size,
-            bdcfg->erase_count);
+            cfg->read_size, cfg->prog_size, cfg->block_size, cfg->block_count,
+            path, (void*)bdcfg, bdcfg->erase_value);
     lfs_filebd_t *bd = cfg->context;
     bd->cfg = bdcfg;
 
@@ -41,12 +40,29 @@ int lfs_filebd_create(const struct lfs_config *cfg, const char *path,
 
     if (bd->fd < 0) {
         int err = -errno;
-        LFS_FILEBD_TRACE("lfs_filebd_create -> %d", err);
+        LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", err);
         return err;
     }
 
-    LFS_FILEBD_TRACE("lfs_filebd_create -> %d", 0);
+    LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", 0);
     return 0;
+}
+
+int lfs_filebd_create(const struct lfs_config *cfg, const char *path) {
+    LFS_FILEBD_TRACE("lfs_filebd_create(%p {.context=%p, "
+                ".read=%p, .prog=%p, .erase=%p, .sync=%p, "
+                ".read_size=%"PRIu32", .prog_size=%"PRIu32", "
+                ".block_size=%"PRIu32", .block_count=%"PRIu32"}, "
+                "\"%s\")",
+            (void*)cfg, cfg->context,
+            (void*)(uintptr_t)cfg->read, (void*)(uintptr_t)cfg->prog,
+            (void*)(uintptr_t)cfg->erase, (void*)(uintptr_t)cfg->sync,
+            cfg->read_size, cfg->prog_size, cfg->block_size, cfg->block_count,
+            path);
+    static const struct lfs_filebd_config defaults = {.erase_value=-1};
+    int err = lfs_filebd_createcfg(cfg, path, &defaults);
+    LFS_FILEBD_TRACE("lfs_filebd_create -> %d", err);
+    return err;
 }
 
 int lfs_filebd_destroy(const struct lfs_config *cfg) {
@@ -70,17 +86,18 @@ int lfs_filebd_read(const struct lfs_config *cfg, lfs_block_t block,
     lfs_filebd_t *bd = cfg->context;
 
     // check if read is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
-    LFS_ASSERT(off  % bd->cfg->read_size == 0);
-    LFS_ASSERT(size % bd->cfg->read_size == 0);
-    LFS_ASSERT(off+size <= bd->cfg->erase_size);
+    LFS_ASSERT(off  % cfg->read_size == 0);
+    LFS_ASSERT(size % cfg->read_size == 0);
+    LFS_ASSERT(block < cfg->block_count);
 
     // zero for reproducibility (in case file is truncated)
-    memset(buffer, 0, size);
+    if (bd->cfg->erase_value != -1) {
+        memset(buffer, bd->cfg->erase_value, size);
+    }
 
     // read
     off_t res1 = lseek(bd->fd,
-            (off_t)block*bd->cfg->erase_size + (off_t)off, SEEK_SET);
+            (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
     if (res1 < 0) {
         int err = -errno;
         LFS_FILEBD_TRACE("lfs_filebd_read -> %d", err);
@@ -100,20 +117,41 @@ int lfs_filebd_read(const struct lfs_config *cfg, lfs_block_t block,
 
 int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
         lfs_off_t off, const void *buffer, lfs_size_t size) {
-    LFS_FILEBD_TRACE("lfs_filebd_prog(%p, "
-                "0x%"PRIx32", %"PRIu32", %p, %"PRIu32")",
+    LFS_FILEBD_TRACE("lfs_filebd_prog(%p, 0x%"PRIx32", %"PRIu32", %p, %"PRIu32")",
             (void*)cfg, block, off, buffer, size);
     lfs_filebd_t *bd = cfg->context;
 
     // check if write is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
-    LFS_ASSERT(off  % bd->cfg->prog_size == 0);
-    LFS_ASSERT(size % bd->cfg->prog_size == 0);
-    LFS_ASSERT(off+size <= bd->cfg->erase_size);
+    LFS_ASSERT(off  % cfg->prog_size == 0);
+    LFS_ASSERT(size % cfg->prog_size == 0);
+    LFS_ASSERT(block < cfg->block_count);
+
+    // check that data was erased? only needed for testing
+    if (bd->cfg->erase_value != -1) {
+        off_t res1 = lseek(bd->fd,
+                (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
+        if (res1 < 0) {
+            int err = -errno;
+            LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+            return err;
+        }
+
+        for (lfs_off_t i = 0; i < size; i++) {
+            uint8_t c;
+            ssize_t res2 = read(bd->fd, &c, 1);
+            if (res2 < 0) {
+                int err = -errno;
+                LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+                return err;
+            }
+
+            LFS_ASSERT(c == bd->cfg->erase_value);
+        }
+    }
 
     // program data
     off_t res1 = lseek(bd->fd,
-            (off_t)block*bd->cfg->erase_size + (off_t)off, SEEK_SET);
+            (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
     if (res1 < 0) {
         int err = -errno;
         LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
@@ -132,36 +170,29 @@ int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
 }
 
 int lfs_filebd_erase(const struct lfs_config *cfg, lfs_block_t block) {
-    LFS_FILEBD_TRACE("lfs_filebd_erase(%p, 0x%"PRIx32" (%"PRIu32"))",
-            (void*)cfg, block, ((lfs_filebd_t*)cfg->context)->cfg->erase_size);
+    LFS_FILEBD_TRACE("lfs_filebd_erase(%p, 0x%"PRIx32")", (void*)cfg, block);
     lfs_filebd_t *bd = cfg->context;
 
     // check if erase is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
+    LFS_ASSERT(block < cfg->block_count);
 
-    // erase block to 0xff to emulate NOR/NAND erased state
-    off_t res1 = lseek(bd->fd,
-            (off_t)block*bd->cfg->erase_size, SEEK_SET);
-    if (res1 < 0) {
-        int err = -errno;
-        LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
-        return err;
-    }
-
-    uint8_t buffer[256];
-    memset(buffer, 0xff, sizeof(buffer));
-
-    lfs_size_t remaining = bd->cfg->erase_size;
-    while (remaining > 0) {
-        lfs_size_t chunk = lfs_min(remaining, (lfs_size_t)sizeof(buffer));
-        ssize_t res2 = write(bd->fd, buffer, chunk);
-        if (res2 < 0) {
+    // erase, only needed for testing
+    if (bd->cfg->erase_value != -1) {
+        off_t res1 = lseek(bd->fd, (off_t)block*cfg->block_size, SEEK_SET);
+        if (res1 < 0) {
             int err = -errno;
             LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
             return err;
         }
 
-        remaining -= chunk;
+        for (lfs_off_t i = 0; i < cfg->block_size; i++) {
+            ssize_t res2 = write(bd->fd, &(uint8_t){bd->cfg->erase_value}, 1);
+            if (res2 < 0) {
+                int err = -errno;
+                LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
+                return err;
+            }
+        }
     }
 
     LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", 0);
@@ -170,11 +201,10 @@ int lfs_filebd_erase(const struct lfs_config *cfg, lfs_block_t block) {
 
 int lfs_filebd_sync(const struct lfs_config *cfg) {
     LFS_FILEBD_TRACE("lfs_filebd_sync(%p)", (void*)cfg);
-
     // file sync
     lfs_filebd_t *bd = cfg->context;
     #ifdef _WIN32
-    int err = FlushFileBuffers((HANDLE) _get_osfhandle(bd->fd)) ? 0 : -1;
+    int err = FlushFileBuffers((HANDLE) _get_osfhandle(fd)) ? 0 : -1;
     #else
     int err = fsync(bd->fd);
     #endif
