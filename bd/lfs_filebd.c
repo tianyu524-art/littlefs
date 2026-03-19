@@ -139,8 +139,30 @@ int lfs_filebd_erase(const struct lfs_config *cfg, lfs_block_t block) {
     // check if erase is valid
     LFS_ASSERT(block < bd->cfg->erase_count);
 
-    // erase is a noop
-    (void)block;
+    // erase block to 0xff to emulate NOR/NAND erased state
+    off_t res1 = lseek(bd->fd,
+            (off_t)block*bd->cfg->erase_size, SEEK_SET);
+    if (res1 < 0) {
+        int err = -errno;
+        LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
+        return err;
+    }
+
+    uint8_t buffer[256];
+    memset(buffer, 0xff, sizeof(buffer));
+
+    lfs_size_t remaining = bd->cfg->erase_size;
+    while (remaining > 0) {
+        lfs_size_t chunk = lfs_min(remaining, (lfs_size_t)sizeof(buffer));
+        ssize_t res2 = write(bd->fd, buffer, chunk);
+        if (res2 < 0) {
+            int err = -errno;
+            LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
+            return err;
+        }
+
+        remaining -= chunk;
+    }
 
     LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", 0);
     return 0;

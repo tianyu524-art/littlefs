@@ -1,823 +1,2208 @@
 /*
- * littlefs Windows Simulator
- * 
- * A command-line tool to simulate littlefs file system operations
- * Supports mounting image files, creating files, and performing read/write/rename operations
+ * littlefs simulator
+ *
+ * A simple Windows/Linux command-line simulator that runs the real littlefs
+ * sources against a file-backed block device.
  */
 
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
-#include <io.h>
-#include <fcntl.h>
-#include <stdbool.h>
-#include <windows.h>
 #include <direct.h>
-#include <unistd.h>  // For access function in MSYS2
-#define access _access
-#define F_OK 0
-#define mkdir _mkdir
+#define strcasecmp _stricmp
 #else
 #include <unistd.h>
-#include <sys/stat.h>
-#include <getopt.h>
-#include <stdbool.h>
 #endif
 
-// For getopt which might not be available on Windows by default
-#ifndef _WIN32
-#include <getopt.h>
-#endif
-
-#ifdef _WIN32
-#include <getopt.h>  // If available in MSYS2 environment
-#include <sys/stat.h>
-#endif
-
-#include "lfs.h"
 #include "bd/lfs_filebd.h"
+#include "lfs.h"
+#include "lfs_util.h"
 
-// Default configuration - make them const to ensure compile-time initialization
-static const int read_size = 16;
-static const int prog_size = 16;
-static const int block_size = 512;
-static const int block_count = 1024;  // 512KB - back to original
-static const int cache_size = 512;   // Use larger cache size for better consistency
+#define SIM_PATH_MAX 1024
+#define SIM_LINE_MAX 4096
+#define SIM_ARGV_MAX 64
+#define SIM_READ_CHUNK 4096
 
-// Static buffers for littlefs - use larger size to avoid potential issues
-static uint8_t read_buffer[512] = {0};  // Size should match block_size or prog_size
-static uint8_t prog_buffer[512] = {0};  // Size should match block_size or prog_size  
-static uint32_t lookahead_buffer[512/sizeof(uint32_t)] = {0};  // For lookahead (enough for 512*8 bits)
+#define DEFAULT_BLOCK_SIZE      (128u * 1024u)
+#define DEFAULT_BLOCK_COUNT     256u
+#define DEFAULT_READ_SIZE       256u
+#define DEFAULT_PROG_SIZE       256u
+#define DEFAULT_CACHE_SIZE      1024u
+#define DEFAULT_LOOKAHEAD_SIZE  32u
+#define DEFAULT_BLOCK_CYCLES    500
 
-// Current working directory support  
-static char current_path[1024] = "/";  // Current directory path (increased size)
+typedef struct sim_storage_cfg {
+    lfs_size_t read_size;
+    lfs_size_t prog_size;
+    lfs_size_t block_size;
+    lfs_size_t block_count;
+    lfs_size_t cache_size;
+    lfs_size_t lookahead_size;
+    int32_t block_cycles;
+} sim_storage_cfg_t;
 
-// Block device context - initialized at runtime
-static struct lfs_filebd bd = {0};
-static struct lfs_config cfg = {0};
-static lfs_t lfs = {0};
-static char *image_path = NULL;
-static bool mounted = false;
+typedef struct cli_options {
+    const char *command;
+    const char *image_path;
+    const char *script_path;
+    bool stop_on_error;
 
-// Function declarations
-static int init_lfs_config(const char *img_path);
-static int mount_filesystem();
-static int unmount_filesystem();
-static int format_filesystem();
-static void print_help();
-static int cmd_ls();
-static int cmd_create(const char *path);
-static int cmd_write(const char *path, const char *data);
-static int cmd_read(const char *path);
-static int cmd_rm(const char *path);
-static int cmd_mkdir(const char *path);
-static int cmd_rename(const char *old_path, const char *new_path);
-static int cmd_cd(const char *path);
-static int cmd_pwd();
+    bool has_read_size;
+    bool has_prog_size;
+    bool has_block_size;
+    bool has_block_count;
 
-int main(int argc, char *argv[]) {
-    int c;
-    bool format_flag = false;
-    char *cmd = NULL;
-    char *arg1 = NULL;
-    char *arg2 = NULL;
-    
-    while ((c = getopt(argc, argv, "hfi:c:w:r:m:d:n:")) != -1) {
-        switch (c) {
-            case 'h':
-                print_help();
-                return 0;
-            case 'f':
-                format_flag = true;
-                break;
-            case 'i':
-                image_path = optarg;
-                break;
-            case 'c':
-                cmd = "create";
-                arg1 = optarg;
-                break;
-            case 'w':
-                cmd = "write";
-                arg1 = optarg;
-                // Extract path and data: path=data
-                {
-                    char *eq_w = strchr(optarg, '=');
-                    if (eq_w) {
-                        *eq_w = '\0';
-                        arg1 = optarg;
-                        arg2 = eq_w + 1;
-                    }
-                }
-                break;
-            case 'r':
-                cmd = "read";
-                arg1 = optarg;
-                break;
-            case 'm':
-                cmd = "mkdir";
-                arg1 = optarg;
-                break;
-            case 'd':
-                cmd = "rm";
-                arg1 = optarg;
-                break;
-            case 'n':
-                cmd = "rename";
-                arg1 = optarg;
-                // Extract old and new path: old=new
-                {
-                    char *eq_n = strchr(optarg, '=');
-                    if (eq_n) {
-                        *eq_n = '\0';
-                        arg1 = optarg;
-                        arg2 = eq_n + 1;
-                    }
-                }
-                break;
-            default:
-                fprintf(stderr, "Unknown option: %c\n", c);
-                print_help();
-                return 1;
-        }
+    lfs_size_t read_size;
+    lfs_size_t prog_size;
+    lfs_size_t block_size;
+    lfs_size_t block_count;
+} cli_options_t;
+
+typedef struct sim_state {
+    sim_storage_cfg_t storage;
+    lfs_filebd_t bd;
+    struct lfs_filebd_config bd_cfg;
+    struct lfs_config cfg;
+    lfs_t lfs;
+
+    uint8_t *read_buffer;
+    uint8_t *prog_buffer;
+    uint8_t *lookahead_buffer;
+
+    bool device_open;
+    bool mounted;
+    char image_path[SIM_PATH_MAX];
+    char current_path[SIM_PATH_MAX];
+} sim_state_t;
+
+typedef struct tree_stats {
+    int dirs;
+    int files;
+    int corrupted;
+    uint64_t total_bytes;
+} tree_stats_t;
+
+typedef struct block_usage_map {
+    uint8_t *used;
+    lfs_size_t count;
+} block_usage_map_t;
+
+static void print_help(void);
+static int parse_cli(int argc, char **argv, cli_options_t *options);
+static void storage_cfg_set_defaults(sim_storage_cfg_t *storage);
+static void storage_cfg_apply_overrides(
+        sim_storage_cfg_t *storage, const cli_options_t *options);
+static void storage_cfg_autosize_lookahead(sim_storage_cfg_t *storage);
+static int storage_cfg_validate(const sim_storage_cfg_t *storage);
+static int parse_size_arg(const char *text, lfs_size_t *value);
+static void make_sidecar_path(
+        const char *image_path, char *buffer, size_t buffer_size);
+static int save_sidecar_config(
+        const char *image_path, const sim_storage_cfg_t *storage);
+static int load_sidecar_config(
+        const char *image_path, sim_storage_cfg_t *storage, bool *found);
+static int create_blank_image(
+        const char *image_path, const sim_storage_cfg_t *storage);
+static int image_file_size(const char *image_path, uint64_t *size);
+static int infer_geometry_from_image(
+        const char *image_path, sim_storage_cfg_t *storage);
+static int validate_image_size(
+        const char *image_path, const sim_storage_cfg_t *storage);
+static int file_exists(const char *path);
+
+static void sim_state_init(sim_state_t *sim);
+static void sim_state_deinit(sim_state_t *sim);
+static int sim_open_device(sim_state_t *sim, const char *image_path);
+static int sim_mount(sim_state_t *sim);
+static int sim_unmount(sim_state_t *sim);
+static int sim_format(sim_state_t *sim);
+
+static int resolve_path(
+        const sim_state_t *sim, const char *input, char *output, size_t output_size);
+static char *join_args(int argc, char **argv, int start);
+static int split_command(char *line, char **argv, int max_args);
+static char *trim_whitespace(char *text);
+
+static int cmd_help(sim_state_t *sim, int argc, char **argv);
+static int cmd_ls(sim_state_t *sim, int argc, char **argv);
+static int cmd_cd(sim_state_t *sim, int argc, char **argv);
+static int cmd_pwd(sim_state_t *sim, int argc, char **argv);
+static int cmd_cat(sim_state_t *sim, int argc, char **argv);
+static int cmd_hexdump(sim_state_t *sim, int argc, char **argv);
+static int cmd_create_file(sim_state_t *sim, int argc, char **argv);
+static int cmd_write(sim_state_t *sim, int argc, char **argv);
+static int cmd_mkdir(sim_state_t *sim, int argc, char **argv);
+static int cmd_rm(sim_state_t *sim, int argc, char **argv);
+static int cmd_cp(sim_state_t *sim, int argc, char **argv);
+static int cmd_rename(sim_state_t *sim, int argc, char **argv);
+static int cmd_stat(sim_state_t *sim, int argc, char **argv);
+static int cmd_mount(sim_state_t *sim, int argc, char **argv);
+static int cmd_umount(sim_state_t *sim, int argc, char **argv);
+static int cmd_format(sim_state_t *sim, int argc, char **argv);
+static int cmd_tree(sim_state_t *sim, int argc, char **argv);
+static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv);
+static int cmd_inspect(sim_state_t *sim, int argc, char **argv);
+
+static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *should_exit);
+static int run_shell(sim_state_t *sim);
+static int run_script(sim_state_t *sim, const char *script_path, bool stop_on_error);
+static int remove_path_recursive(sim_state_t *sim, const char *path);
+static int tree_walk(sim_state_t *sim, const char *path, int level, int max_depth,
+        tree_stats_t *stats);
+static int ensure_mounted(sim_state_t *sim);
+static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer, lfs_size_t *size);
+static void print_hexdump(const uint8_t *data, size_t size);
+static void print_hexdump_with_base(
+        const uint8_t *data, size_t size, uint32_t base_offset);
+static void print_erased_block_preview(size_t block_size);
+static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size);
+static int read_device_bytes(
+        sim_state_t *sim, uint64_t offset, void *buffer, size_t size);
+static int read_device_block(
+        sim_state_t *sim, lfs_block_t block, uint8_t *buffer);
+static int inspect_mark_used_block(void *data, lfs_block_t block);
+static const char *meta_tag_type_name(uint16_t type);
+static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t size);
+static bool buffer_is_erased(const uint8_t *buffer, size_t size);
+static int meta_dump_target(sim_state_t *sim, const char *path,
+        bool block_only, bool parsed_only);
+
+int main(int argc, char **argv) {
+    cli_options_t options;
+    memset(&options, 0, sizeof(options));
+
+    int err = parse_cli(argc, argv, &options);
+    if (err) {
+        return (err == 2) ? 0 : (err > 0 ? err : 1);
     }
 
-    if (!image_path) {
-        fprintf(stderr, "Error: Image path is required (-i option)\n");
+    if (strcmp(options.command, "create") == 0) {
+        sim_storage_cfg_t storage;
+        storage_cfg_set_defaults(&storage);
+        storage_cfg_apply_overrides(&storage, &options);
+        storage_cfg_autosize_lookahead(&storage);
+
+        err = storage_cfg_validate(&storage);
+        if (err) {
+            return 1;
+        }
+
+        err = create_blank_image(options.image_path, &storage);
+        if (err) {
+            return 1;
+        }
+
+        err = save_sidecar_config(options.image_path, &storage);
+        if (err) {
+            return 1;
+        }
+
+        printf("Created image: %s\n", options.image_path);
+        printf("  block_size  : %"PRIu32"\n", (uint32_t)storage.block_size);
+        printf("  block_count : %"PRIu32"\n", (uint32_t)storage.block_count);
+        printf("  read_size   : %"PRIu32"\n", (uint32_t)storage.read_size);
+        printf("  prog_size   : %"PRIu32"\n", (uint32_t)storage.prog_size);
+        return 0;
+    }
+
+    sim_storage_cfg_t storage;
+    storage_cfg_set_defaults(&storage);
+
+    bool sidecar_found = false;
+    err = load_sidecar_config(options.image_path, &storage, &sidecar_found);
+    if (err) {
+        return 1;
+    }
+    storage_cfg_apply_overrides(&storage, &options);
+
+    if (!file_exists(options.image_path)) {
+        fprintf(stderr, "Image does not exist: %s\n", options.image_path);
+        return 1;
+    }
+
+    err = infer_geometry_from_image(options.image_path, &storage);
+    if (err) {
+        return 1;
+    }
+
+    err = storage_cfg_validate(&storage);
+    if (err) {
+        return 1;
+    }
+
+    err = validate_image_size(options.image_path, &storage);
+    if (err) {
+        return 1;
+    }
+
+    sim_state_t sim;
+    sim_state_init(&sim);
+    sim.storage = storage;
+
+    err = sim_open_device(&sim, options.image_path);
+    if (err) {
+        sim_state_deinit(&sim);
+        return 1;
+    }
+
+    printf("Opened image: %s\n", options.image_path);
+    if (sidecar_found) {
+        printf("Loaded sidecar config.\n");
+    } else {
+        printf("Sidecar config not found, using defaults/overrides.\n");
+    }
+
+    err = sim_mount(&sim);
+    if (err) {
+        printf("Continuing with device open but filesystem unmounted.\n");
+        err = 0;
+    }
+
+    if (strcmp(options.command, "open") == 0) {
+        err = run_shell(&sim);
+    } else {
+        err = run_script(&sim, options.script_path, options.stop_on_error);
+    }
+
+    sim_state_deinit(&sim);
+    return (err == 0) ? 0 : 1;
+}
+
+static void print_help(void) {
+    printf("littlefs simulator\n");
+    printf("\n");
+    printf("Commands:\n");
+    printf("  create --image <file.bin> [--block-size N] [--block-count N]\n");
+    printf("         [--read-size N] [--prog-size N]\n");
+    printf("  open <file.bin> [--block-size N] [--block-count N]\n");
+    printf("       [--read-size N] [--prog-size N]\n");
+    printf("  run <script.lfs> --image <file.bin> [--stop-on-error]\n");
+    printf("      [--block-size N] [--block-count N] [--read-size N] [--prog-size N]\n");
+    printf("\n");
+    printf("Default flash config:\n");
+    printf("  block_size  = %u bytes\n", DEFAULT_BLOCK_SIZE);
+    printf("  block_count = %u\n", DEFAULT_BLOCK_COUNT);
+    printf("  read_size   = %u bytes\n", DEFAULT_READ_SIZE);
+    printf("  prog_size   = %u bytes\n", DEFAULT_PROG_SIZE);
+    printf("\n");
+    printf("Shell commands:\n");
+    printf("  ls [path]\n");
+    printf("  cd <path>\n");
+    printf("  pwd\n");
+    printf("  cat <file>\n");
+    printf("  hexdump <file>\n");
+    printf("  create <file>\n");
+    printf("  write <file> <data>\n");
+    printf("  mkdir <dir>\n");
+    printf("  rm <path> [--recursive]\n");
+    printf("  cp <src> <dst>\n");
+    printf("  rename <src> <dst>\n");
+    printf("  stat <path>\n");
+    printf("  tree [path] [--depth N]\n");
+    printf("  meta-dump <path> [--block-only] [--parsed-only]\n");
+    printf("  inspect blocks\n");
+    printf("  inspect block <N>\n");
+    printf("  format\n");
+    printf("  mount\n");
+    printf("  umount\n");
+    printf("  help\n");
+    printf("  quit\n");
+}
+
+static int parse_cli(int argc, char **argv, cli_options_t *options) {
+    if (argc < 2) {
         print_help();
         return 1;
     }
 
-    printf("littlefs Windows Simulator\n");
-    printf("Image: %s\n", image_path);
-    
-    // Initialize the configuration
-    if (init_lfs_config(image_path) != 0) {
-        fprintf(stderr, "Failed to initialize littlefs configuration\n");
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_help();
+        return 2;
+    }
+
+    options->command = argv[1];
+    if (strcmp(options->command, "create") != 0 &&
+            strcmp(options->command, "open") != 0 &&
+            strcmp(options->command, "run") != 0) {
+        fprintf(stderr, "Unknown command: %s\n", options->command);
+        print_help();
         return 1;
     }
-    
-    // Handle formatting flag first
-    if (format_flag) {
-        if (format_filesystem() != 0) {
-            fprintf(stderr, "Failed to format filesystem\n");
-            return 1;
-        }
-        if (mount_filesystem() != 0) {
-            fprintf(stderr, "Failed to mount filesystem after format\n");
-            return 1;
-        }
-    } else {
-        // Mount the filesystem
-        if (mount_filesystem() != 0) {
-            printf("Mount failed. Attempting to format...\n");
-            if (format_filesystem() != 0) {
-                fprintf(stderr, "Failed to format filesystem\n");
+
+    for (int i = 2; i < argc; i++) {
+        const char *arg = argv[i];
+
+        if (strcmp(arg, "--image") == 0) {
+            if (i+1 >= argc) {
+                fprintf(stderr, "--image requires a value\n");
                 return 1;
             }
-            if (mount_filesystem() != 0) {
-                fprintf(stderr, "Failed to mount filesystem after format\n");
+            options->image_path = argv[++i];
+        } else if (strcmp(arg, "--block-size") == 0) {
+            if (i+1 >= argc || parse_size_arg(argv[++i], &options->block_size)) {
+                fprintf(stderr, "Invalid --block-size value\n");
                 return 1;
             }
-        }
-    }
-    
-    // Execute command if provided
-    if (cmd) {
-        if (strcmp(cmd, "create") == 0) {
-            cmd_create(arg1);
-        } else if (strcmp(cmd, "write") == 0) {
-            cmd_write(arg1, arg2);
-        } else if (strcmp(cmd, "read") == 0) {
-            cmd_read(arg1);
-        } else if (strcmp(cmd, "rm") == 0) {
-            cmd_rm(arg1);
-        } else if (strcmp(cmd, "mkdir") == 0) {
-            cmd_mkdir(arg1);
-        } else if (strcmp(cmd, "rename") == 0) {
-            cmd_rename(arg1, arg2);
-        } else if (strcmp(cmd, "ls") == 0) {
-            cmd_ls();
-        }
-    } else {
-        // Interactive mode
-        printf("Filesystem mounted. Enter commands (ls, create, read, write, mkdir, rm, rename, quit):\n");
-        char input[256];
-        while (fgets(input, sizeof(input), stdin)) {
-            // Remove newline
-            input[strcspn(input, "\n")] = 0;
-            
-            if (strcmp(input, "quit") == 0 || strcmp(input, "exit") == 0) {
-                break;
-            } else if (strcmp(input, "ls") == 0) {
-                cmd_ls();
-            } else if (strncmp(input, "create ", 7) == 0) {
-                cmd_create(input + 7);
-            } else if (strncmp(input, "mkdir ", 6) == 0) {
-                cmd_mkdir(input + 6);
-            } else if (strncmp(input, "rm ", 3) == 0) {
-                cmd_rm(input + 3);
-            } else if (strncmp(input, "read ", 5) == 0) {
-                cmd_read(input + 5);
-            } else if (strncmp(input, "write ", 6) == 0) {
-                // Parse write command: write path=data
-                char *path = input + 6;
-                char *eq = strchr(path, '=');
-                if (eq) {
-                    *eq = '\0';
-                    cmd_write(path, eq + 1);
-                } else {
-                    printf("Usage: write path=data\n");
-                }
-            } else if (strncmp(input, "rename ", 7) == 0) {
-                // Parse rename command: rename old_path=new_path
-                char *path = input + 7;
-                char *eq = strchr(path, '=');
-                if (eq) {
-                    *eq = '\0';
-                    cmd_rename(path, eq + 1);
-                } else {
-                    printf("Usage: rename old_path=new_path\n");
-                }
-            } else if (strncmp(input, "cd ", 3) == 0) {
-                cmd_cd(input + 3);
-            } else if (strcmp(input, "pwd") == 0) {
-                cmd_pwd();
-            } else {
-                printf("Unknown command. Available: ls, create, read, write, mkdir, rm, rename, cd, pwd, quit\n");
+            options->has_block_size = true;
+        } else if (strcmp(arg, "--block-count") == 0) {
+            if (i+1 >= argc || parse_size_arg(argv[++i], &options->block_count)) {
+                fprintf(stderr, "Invalid --block-count value\n");
+                return 1;
             }
+            options->has_block_count = true;
+        } else if (strcmp(arg, "--read-size") == 0) {
+            if (i+1 >= argc || parse_size_arg(argv[++i], &options->read_size)) {
+                fprintf(stderr, "Invalid --read-size value\n");
+                return 1;
+            }
+            options->has_read_size = true;
+        } else if (strcmp(arg, "--prog-size") == 0) {
+            if (i+1 >= argc || parse_size_arg(argv[++i], &options->prog_size)) {
+                fprintf(stderr, "Invalid --prog-size value\n");
+                return 1;
+            }
+            options->has_prog_size = true;
+        } else if (strcmp(arg, "--stop-on-error") == 0) {
+            options->stop_on_error = true;
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", arg);
+            return 1;
+        } else if (strcmp(options->command, "open") == 0 && options->image_path == NULL) {
+            options->image_path = arg;
+        } else if (strcmp(options->command, "run") == 0 && options->script_path == NULL) {
+            options->script_path = arg;
+        } else if (strcmp(options->command, "create") == 0 && options->image_path == NULL) {
+            options->image_path = arg;
+        } else {
+            fprintf(stderr, "Unexpected positional argument: %s\n", arg);
+            return 1;
         }
     }
-    
-    unmount_filesystem();
+
+    if (strcmp(options->command, "run") == 0 && options->script_path == NULL) {
+        fprintf(stderr, "run requires a script path\n");
+        return 1;
+    }
+
+    if (options->image_path == NULL) {
+        fprintf(stderr, "%s requires an image path\n", options->command);
+        return 1;
+    }
+
     return 0;
 }
 
-static int init_lfs_config(const char *img_path) {
-    // Initialize the lfs_config struct completely before use
-    memset(&cfg, 0, sizeof(cfg));  // Clear entire config struct
-    
-    // Initialize configuration - make sure context and function pointers are set BEFORE calling lfs_filebd_create
-    cfg.context = &bd;
-    cfg.read  = lfs_filebd_read;
-    cfg.prog  = lfs_filebd_prog;
-    cfg.erase = lfs_filebd_erase;
-    cfg.sync  = lfs_filebd_sync;
-
-    // Initialize block device config
-    struct lfs_filebd_config bd_cfg = {
-        .read_size = read_size,
-        .prog_size = prog_size,
-        .erase_size = block_size,
-        .erase_count = block_count
-    };
-    
-    // Create the block device - this should now work since cfg.context is properly set
-    int err = lfs_filebd_create(&cfg, img_path, &bd_cfg);
-    if (err) {
-        fprintf(stderr, "Failed to create block device: %d\n", err);
-        return err;
-    }
-    
-    // Set custom attributes for the block device
-    cfg.read_size = read_size;
-    cfg.prog_size = prog_size;
-    cfg.block_size = block_size;
-    cfg.block_count = block_count;
-    cfg.cache_size = cache_size;  // Use the defined cache_size
-    cfg.lookahead_size = 16;
-    cfg.block_cycles = 500;  // Wear leveling cycles
-    
-    // Optional static buffers
-    cfg.read_buffer = read_buffer;
-    cfg.prog_buffer = prog_buffer;
-    cfg.lookahead_buffer = lookahead_buffer;
-    
-    // Ensure proper initialization for all config fields to avoid undefined behavior
-    cfg.name_max = LFS_NAME_MAX;  // Use default name max
-    cfg.file_max = LFS_FILE_MAX;  // Use default file max
-    cfg.attr_max = LFS_ATTR_MAX;  // Use default attr max
-    cfg.metadata_max = block_size;  // Set metadata max to block size
-    
-    // Increase lookahead size for better metadata handling - must be multiple of 8 and match buffer
-    cfg.lookahead_size = 64;  // Use 64 bytes for lookahead (enough for 512 bits)
-    
-    return 0;
+static void storage_cfg_set_defaults(sim_storage_cfg_t *storage) {
+    storage->read_size = DEFAULT_READ_SIZE;
+    storage->prog_size = DEFAULT_PROG_SIZE;
+    storage->block_size = DEFAULT_BLOCK_SIZE;
+    storage->block_count = DEFAULT_BLOCK_COUNT;
+    storage->cache_size = DEFAULT_CACHE_SIZE;
+    storage->lookahead_size = DEFAULT_LOOKAHEAD_SIZE;
+    storage->block_cycles = DEFAULT_BLOCK_CYCLES;
 }
 
-static int mount_filesystem() {
-    // Make sure config is fully initialized before mounting
-    if (cfg.read == NULL || cfg.prog == NULL || cfg.erase == NULL || cfg.sync == NULL) {
-        fprintf(stderr, "Error: Config not properly initialized\n");
+static void storage_cfg_apply_overrides(
+        sim_storage_cfg_t *storage, const cli_options_t *options) {
+    if (options->has_read_size) {
+        storage->read_size = options->read_size;
+    }
+    if (options->has_prog_size) {
+        storage->prog_size = options->prog_size;
+    }
+    if (options->has_block_size) {
+        storage->block_size = options->block_size;
+        if (storage->cache_size > storage->block_size) {
+            storage->cache_size = storage->block_size;
+        }
+    }
+    if (options->has_block_count) {
+        storage->block_count = options->block_count;
+    }
+}
+
+static void storage_cfg_autosize_lookahead(sim_storage_cfg_t *storage) {
+    if (storage->block_count == 0) {
+        return;
+    }
+
+    uint64_t min_bytes = ((uint64_t)storage->block_count + 7u) / 8u;
+    uint64_t aligned = ((min_bytes + 7u) / 8u) * 8u;
+    lfs_size_t required = (lfs_size_t)aligned;
+
+    if (storage->lookahead_size < required) {
+        storage->lookahead_size = required;
+    }
+}
+
+static int storage_cfg_validate(const sim_storage_cfg_t *storage) {
+    if (storage->read_size == 0 || storage->prog_size == 0 ||
+            storage->block_size == 0 || storage->block_count == 0) {
+        fprintf(stderr, "Storage config contains zero values\n");
         return -1;
     }
-    int err = lfs_mount(&lfs, &cfg);
+
+    if (storage->block_size < 128) {
+        fprintf(stderr, "block_size must be >= 128\n");
+        return -1;
+    }
+
+    if (storage->block_size % storage->read_size != 0) {
+        fprintf(stderr, "block_size must be a multiple of read_size\n");
+        return -1;
+    }
+
+    if (storage->block_size % storage->prog_size != 0) {
+        fprintf(stderr, "block_size must be a multiple of prog_size\n");
+        return -1;
+    }
+
+    if (storage->cache_size < storage->read_size ||
+            storage->cache_size < storage->prog_size) {
+        fprintf(stderr, "cache_size must be >= read_size/prog_size\n");
+        return -1;
+    }
+
+    if (storage->block_size % storage->cache_size != 0) {
+        fprintf(stderr, "block_size must be a multiple of cache_size\n");
+        return -1;
+    }
+
+    if (storage->lookahead_size == 0 || storage->lookahead_size % 8 != 0) {
+        fprintf(stderr, "lookahead_size must be a non-zero multiple of 8\n");
+        return -1;
+    }
+
+    if (storage->lookahead_size * 8 < storage->block_count) {
+        fprintf(stderr, "lookahead_size is too small for block_count\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int parse_size_arg(const char *text, lfs_size_t *value) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 0);
+    if (errno || end == text || *end != '\0') {
+        return -1;
+    }
+
+    *value = (lfs_size_t)parsed;
+    return 0;
+}
+
+static void make_sidecar_path(
+        const char *image_path, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "%s.cfg", image_path);
+}
+
+static int save_sidecar_config(
+        const char *image_path, const sim_storage_cfg_t *storage) {
+    char sidecar[SIM_PATH_MAX];
+    make_sidecar_path(image_path, sidecar, sizeof(sidecar));
+
+    FILE *f = fopen(sidecar, "w");
+    if (!f) {
+        fprintf(stderr, "Failed to write sidecar config %s: %s\n",
+                sidecar, strerror(errno));
+        return -1;
+    }
+
+    fprintf(f, "block_size=%"PRIu32"\n", (uint32_t)storage->block_size);
+    fprintf(f, "block_count=%"PRIu32"\n", (uint32_t)storage->block_count);
+    fprintf(f, "read_size=%"PRIu32"\n", (uint32_t)storage->read_size);
+    fprintf(f, "prog_size=%"PRIu32"\n", (uint32_t)storage->prog_size);
+    fclose(f);
+    return 0;
+}
+
+static int load_sidecar_config(
+        const char *image_path, sim_storage_cfg_t *storage, bool *found) {
+    char sidecar[SIM_PATH_MAX];
+    make_sidecar_path(image_path, sidecar, sizeof(sidecar));
+    *found = false;
+
+    FILE *f = fopen(sidecar, "r");
+    if (!f) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        fprintf(stderr, "Failed to read sidecar config %s: %s\n",
+                sidecar, strerror(errno));
+        return -1;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *trimmed = trim_whitespace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#') {
+            continue;
+        }
+
+        char *eq = strchr(trimmed, '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim_whitespace(trimmed);
+        char *value = trim_whitespace(eq + 1);
+
+        lfs_size_t parsed = 0;
+        if (parse_size_arg(value, &parsed)) {
+            continue;
+        }
+
+        if (strcmp(key, "block_size") == 0) {
+            storage->block_size = parsed;
+        } else if (strcmp(key, "block_count") == 0) {
+            storage->block_count = parsed;
+        } else if (strcmp(key, "read_size") == 0) {
+            storage->read_size = parsed;
+        } else if (strcmp(key, "prog_size") == 0) {
+            storage->prog_size = parsed;
+        }
+    }
+
+    fclose(f);
+    *found = true;
+    return 0;
+}
+
+static int create_blank_image(
+        const char *image_path, const sim_storage_cfg_t *storage) {
+    FILE *f = fopen(image_path, "wb");
+    if (!f) {
+        fprintf(stderr, "Failed to create image %s: %s\n",
+                image_path, strerror(errno));
+        return -1;
+    }
+
+    uint8_t *chunk = malloc(1024 * 1024);
+    if (!chunk) {
+        fclose(f);
+        fprintf(stderr, "Out of memory while creating image\n");
+        return -1;
+    }
+    memset(chunk, 0xff, 1024 * 1024);
+
+    uint64_t total = (uint64_t)storage->block_size * storage->block_count;
+    while (total > 0) {
+        size_t n = (size_t)lfs_min((uint64_t)(1024 * 1024), total);
+        if (fwrite(chunk, 1, n, f) != n) {
+            free(chunk);
+            fclose(f);
+            fprintf(stderr, "Failed to initialize image %s: %s\n",
+                    image_path, strerror(errno));
+            return -1;
+        }
+        total -= n;
+    }
+
+    free(chunk);
+    fclose(f);
+    return 0;
+}
+
+static int image_file_size(const char *image_path, uint64_t *size) {
+    struct stat st;
+    if (stat(image_path, &st) != 0) {
+        fprintf(stderr, "Failed to stat %s: %s\n", image_path, strerror(errno));
+        return -1;
+    }
+
+    *size = (uint64_t)st.st_size;
+    return 0;
+}
+
+static int infer_geometry_from_image(
+        const char *image_path, sim_storage_cfg_t *storage) {
+    uint64_t image_size = 0;
+    int err = image_file_size(image_path, &image_size);
     if (err) {
-        printf("Mount failed with error: %d\n", err);
         return err;
     }
-    mounted = true;
-    printf("Filesystem mounted successfully\n");
-    return 0;
-}
 
-static int unmount_filesystem() {
-    if (mounted) {
-        // First sync the filesystem to ensure all changes are written
-        // Note: There's no direct lfs_sync function, but proper close operations should sync
-        
-        int err = lfs_unmount(&lfs);
-        if (err) {
-            printf("Warning: lfs_unmount returned %d\n", err);
-        }
-        mounted = false;
-        printf("Filesystem unmounted\n");
+    if (storage->block_size == 0) {
+        fprintf(stderr, "block_size must be non-zero before inferring geometry\n");
+        return -1;
     }
+
+    if (image_size == 0) {
+        fprintf(stderr, "Image %s is empty\n", image_path);
+        return -1;
+    }
+
+    if (image_size % storage->block_size != 0) {
+        fprintf(stderr,
+                "Image size mismatch for %s: size %"PRIu64
+                " is not divisible by block_size %"PRIu32"\n",
+                image_path, image_size, (uint32_t)storage->block_size);
+        return -1;
+    }
+
+    lfs_size_t inferred_block_count =
+            (lfs_size_t)(image_size / storage->block_size);
+    if (storage->block_count != inferred_block_count) {
+        printf("Auto-adjusted block_count: %"PRIu32" -> %"PRIu32
+                " based on image size %"PRIu64"\n",
+                (uint32_t)storage->block_count,
+                (uint32_t)inferred_block_count,
+                image_size);
+        storage->block_count = inferred_block_count;
+    }
+
+    lfs_size_t previous_lookahead = storage->lookahead_size;
+    storage_cfg_autosize_lookahead(storage);
+    if (storage->lookahead_size != previous_lookahead) {
+        printf("Auto-adjusted lookahead_size: %"PRIu32" -> %"PRIu32
+                " for block_count %"PRIu32"\n",
+                (uint32_t)previous_lookahead,
+                (uint32_t)storage->lookahead_size,
+                (uint32_t)storage->block_count);
+    }
+
     return 0;
 }
 
-static int format_filesystem() {
-    unmount_filesystem();
-    int err = lfs_format(&lfs, &cfg);
+static int validate_image_size(
+        const char *image_path, const sim_storage_cfg_t *storage) {
+    uint64_t image_size = 0;
+    int err = image_file_size(image_path, &image_size);
+    if (err) {
+        return err;
+    }
+
+    uint64_t expected = (uint64_t)storage->block_size * storage->block_count;
+    if (image_size != expected) {
+        fprintf(stderr,
+                "Image size mismatch for %s: expected %"PRIu64", got %"PRIu64"\n",
+                image_path, expected, image_size);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void sim_state_init(sim_state_t *sim) {
+    memset(sim, 0, sizeof(*sim));
+    strcpy(sim->current_path, "/");
+}
+
+static void sim_state_deinit(sim_state_t *sim) {
+    if (sim->mounted) {
+        lfs_unmount(&sim->lfs);
+        sim->mounted = false;
+    }
+
+    if (sim->device_open) {
+        lfs_filebd_destroy(&sim->cfg);
+        sim->device_open = false;
+    }
+
+    free(sim->read_buffer);
+    free(sim->prog_buffer);
+    free(sim->lookahead_buffer);
+    sim->read_buffer = NULL;
+    sim->prog_buffer = NULL;
+    sim->lookahead_buffer = NULL;
+}
+
+static int sim_open_device(sim_state_t *sim, const char *image_path) {
+    memset(&sim->cfg, 0, sizeof(sim->cfg));
+    memset(&sim->bd_cfg, 0, sizeof(sim->bd_cfg));
+
+    sim->read_buffer = malloc(sim->storage.cache_size);
+    sim->prog_buffer = malloc(sim->storage.cache_size);
+    sim->lookahead_buffer = malloc(sim->storage.lookahead_size);
+    if (!sim->read_buffer || !sim->prog_buffer || !sim->lookahead_buffer) {
+        fprintf(stderr, "Failed to allocate littlefs buffers\n");
+        return -1;
+    }
+
+    sim->bd_cfg.read_size = sim->storage.read_size;
+    sim->bd_cfg.prog_size = sim->storage.prog_size;
+    sim->bd_cfg.erase_size = sim->storage.block_size;
+    sim->bd_cfg.erase_count = sim->storage.block_count;
+
+    sim->cfg.context = &sim->bd;
+    sim->cfg.read = lfs_filebd_read;
+    sim->cfg.prog = lfs_filebd_prog;
+    sim->cfg.erase = lfs_filebd_erase;
+    sim->cfg.sync = lfs_filebd_sync;
+    sim->cfg.read_size = sim->storage.read_size;
+    sim->cfg.prog_size = sim->storage.prog_size;
+    sim->cfg.block_size = sim->storage.block_size;
+    sim->cfg.block_count = sim->storage.block_count;
+    sim->cfg.block_cycles = sim->storage.block_cycles;
+    sim->cfg.cache_size = sim->storage.cache_size;
+    sim->cfg.lookahead_size = sim->storage.lookahead_size;
+    sim->cfg.read_buffer = sim->read_buffer;
+    sim->cfg.prog_buffer = sim->prog_buffer;
+    sim->cfg.lookahead_buffer = sim->lookahead_buffer;
+    sim->cfg.name_max = LFS_NAME_MAX;
+    sim->cfg.file_max = LFS_FILE_MAX;
+    sim->cfg.attr_max = LFS_ATTR_MAX;
+    sim->cfg.metadata_max = sim->storage.block_size;
+    sim->cfg.inline_max = 0;
+
+    int err = lfs_filebd_create(&sim->cfg, image_path, &sim->bd_cfg);
+    if (err) {
+        fprintf(stderr, "Failed to open block device %s: %d\n", image_path, err);
+        return -1;
+    }
+
+    strncpy(sim->image_path, image_path, sizeof(sim->image_path)-1);
+    sim->device_open = true;
+    return 0;
+}
+
+static int sim_mount(sim_state_t *sim) {
+    if (sim->mounted) {
+        printf("Filesystem already mounted.\n");
+        return 0;
+    }
+
+    int err = lfs_mount(&sim->lfs, &sim->cfg);
+    if (err) {
+        fprintf(stderr, "Mount failed: %d\n", err);
+        return err;
+    }
+
+    sim->mounted = true;
+    strcpy(sim->current_path, "/");
+    printf("Filesystem mounted.\n");
+    return 0;
+}
+
+static int sim_unmount(sim_state_t *sim) {
+    if (!sim->mounted) {
+        printf("Filesystem already unmounted.\n");
+        return 0;
+    }
+
+    int err = lfs_unmount(&sim->lfs);
+    if (err) {
+        fprintf(stderr, "Unmount failed: %d\n", err);
+        return err;
+    }
+
+    sim->mounted = false;
+    printf("Filesystem unmounted.\n");
+    return 0;
+}
+
+static int sim_format(sim_state_t *sim) {
+    if (sim->mounted) {
+        int err = lfs_unmount(&sim->lfs);
+        if (err) {
+            fprintf(stderr, "Unmount before format failed: %d\n", err);
+            return err;
+        }
+        sim->mounted = false;
+    }
+
+    int err = lfs_format(&sim->lfs, &sim->cfg);
     if (err) {
         fprintf(stderr, "Format failed: %d\n", err);
         return err;
     }
-    printf("Filesystem formatted successfully\n");
-    return 0;
+
+    printf("Filesystem formatted.\n");
+    return sim_mount(sim);
 }
 
-static void print_help() {
-    printf("littlefs Windows Simulator\n");
-    printf("Usage: littlefs_simulator [OPTIONS]\n");
-    printf("\n");
-    printf("Options:\n");
-    printf("  -h              Show this help\n");
-    printf("  -f              Format filesystem\n");
-    printf("  -i <image>      Image file path\n");
-    printf("  -c <path>       Create file\n");
-    printf("  -w <path=data>  Write data to file\n");
-    printf("  -r <path>       Read file\n");
-    printf("  -m <path>       Create directory\n");
-    printf("  -d <path>       Delete file/directory\n");
-    printf("  -n <old=new>    Rename file/directory\n");
-    printf("\n");
-    printf("Interactive commands:\n");
-    printf("  ls              List directory contents\n");
-    printf("  create <path>   Create a file\n");
-    printf("  mkdir <path>    Create a directory\n");
-    printf("  read <path>     Read a file\n");
-    printf("  write <path=data> Write data to file\n");
-    printf("  rename <old=new> Rename file/directory\n");
-    printf("  cd <path>       Change directory\n");
-    printf("  pwd             Print working directory\n");
-    printf("  rm <path>       Remove file/directory\n");
-    printf("  quit            Exit simulator\n");
-}
-
-static int cmd_ls() {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
+static int resolve_path(
+        const sim_state_t *sim, const char *input, char *output, size_t output_size) {
+    char working[SIM_PATH_MAX * 2];
+    if (!input || input[0] == '\0') {
         return -1;
     }
-    
-    lfs_dir_t dir;
-    int err = lfs_dir_open(&lfs, &dir, current_path);
-    if (err) {
-        printf("Failed to open directory '%s': %d\n", current_path, err);
-        return err;
-    }
-    
-    struct lfs_info info;
-    printf("Contents of directory '%s':\n", current_path);
-    printf("ID\tType\tSize\tName\n");
-    printf("--\t----\t----\t----\n");
-    
-    int id = 0;  // Simple incrementing ID for display purposes
-    
-    while (true) {
-        int res = lfs_dir_read(&lfs, &dir, &info);
-        if (res <= 0) {
-            break;
-        }
-        
-        // Skip special directory entries (like "." and "..")
-        if (info.name[0] == '.' && (info.name[1] == 0 || (info.name[1] == '.' && info.name[2] == 0))) {
-            continue;  // Skip . and .. entries
-        }
-        
-        char type = '?';
-        if (info.type == LFS_TYPE_REG) {
-            type = 'F';  // File
-        } else if (info.type == LFS_TYPE_DIR) {
-            type = 'D';  // Directory
-        }
-        
-        printf("%d\t%c\t%u\t%s\n", id, type, (unsigned int)info.size, info.name);
-        id++;
-    }
-    
-    lfs_dir_close(&lfs, &dir);
-    return 0;
-}
 
-static int cmd_create(const char *path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    // Handle relative path by prepending current path if not in root directory
-    char full_path[1024];
-    if (path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
+    if (input[0] == '/') {
+        snprintf(working, sizeof(working), "%s", input);
+    } else if (strcmp(sim->current_path, "/") == 0) {
+        snprintf(working, sizeof(working), "/%s", input);
     } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_path, sizeof(full_path) - 1, "/%s", path);
-            full_path[sizeof(full_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_path, sizeof(full_path) - 1, "%s/%s", current_path, path);
-            if (len >= sizeof(full_path) - 1) {
-                printf("Path too long: %s\n", full_path);
-                return -1;
-            }
-        }
+        snprintf(working, sizeof(working), "%s/%s", sim->current_path, input);
     }
-    
-    lfs_file_t file;
-    int err = lfs_file_open(&lfs, &file, full_path, LFS_O_CREAT | LFS_O_WRONLY);
-    if (err) {
-        printf("Failed to create file '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    err = lfs_file_close(&lfs, &file);
-    if (err) {
-        printf("Failed to close file '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    printf("Created file: %s\n", full_path);
-    return 0;
-}
 
-static int cmd_write(const char *path, const char *data) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    if (!data) {
-        printf("No data provided for write operation\n");
-        return -1;
-    }
-    
-    // Handle relative path by prepending current path if not in root directory
-    char full_path[1024];
-    if (path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_path, sizeof(full_path) - 1, "/%s", path);
-            full_path[sizeof(full_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_path, sizeof(full_path) - 1, "%s/%s", current_path, path);
-            if (len >= sizeof(full_path) - 1) {
-                printf("Path too long: %s\n", full_path);
-                return -1;
+    char *parts[SIM_ARGV_MAX];
+    int part_count = 0;
+    char *token = strtok(working, "/\\");
+    while (token) {
+        if (strcmp(token, ".") == 0) {
+            // noop
+        } else if (strcmp(token, "..") == 0) {
+            if (part_count > 0) {
+                part_count -= 1;
             }
+        } else if (part_count < SIM_ARGV_MAX) {
+            parts[part_count++] = token;
         }
+        token = strtok(NULL, "/\\");
     }
-    
-    lfs_file_t file;
-    int err = lfs_file_open(&lfs, &file, full_path, LFS_O_CREAT | LFS_O_WRONLY | LFS_O_TRUNC);
-    if (err) {
-        printf("Failed to open file '%s' for writing: %d\n", full_path, err);
-        return err;
-    }
-    
-    lfs_size_t size = strlen(data);
-    lfs_ssize_t res = lfs_file_write(&lfs, &file, data, size);
-    if (res < 0) {
-        printf("Failed to write to file '%s': %d\n", full_path, (int)res);
-        lfs_file_close(&lfs, &file);
-        return res;
-    }
-    
-    err = lfs_file_close(&lfs, &file);
-    if (err) {
-        printf("Failed to close file '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    printf("Wrote %d bytes to file: %s\n", (int)res, full_path);
-    return 0;
-}
 
-static int cmd_read(const char *path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    // Handle relative path by prepending current path if not in root directory
-    char full_path[1024];
-    if (path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_path, sizeof(full_path) - 1, "/%s", path);
-            full_path[sizeof(full_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_path, sizeof(full_path) - 1, "%s/%s", current_path, path);
-            if (len >= sizeof(full_path) - 1) {
-                printf("Path too long: %s\n", full_path);
-                return -1;
-            }
+    if (part_count == 0) {
+        if (output_size < 2) {
+            return -1;
         }
-    }
-    
-    lfs_file_t file;
-    int err = lfs_file_open(&lfs, &file, full_path, LFS_O_RDONLY);
-    if (err) {
-        printf("Failed to open file '%s' for reading: %d\n", full_path, err);
-        return err;
-    }
-    
-    struct lfs_info info;
-    err = lfs_stat(&lfs, full_path, &info);
-    if (err) {
-        printf("Failed to get file info: %d\n", err);
-        lfs_file_close(&lfs, &file);
-        return err;
-    }
-    
-    if (info.type != LFS_TYPE_REG) {
-        printf("'%s' is not a regular file\n", full_path);
-        lfs_file_close(&lfs, &file);
-        return -1;
-    }
-    
-    // Ensure buffer size is properly aligned for block device operations
-    char *buffer = malloc(info.size + 1);
-    if (!buffer) {
-        printf("Failed to allocate memory for reading\n");
-        lfs_file_close(&lfs, &file);
-        return -1;
-    }
-    
-    lfs_ssize_t res = lfs_file_read(&lfs, &file, buffer, info.size);
-    if (res < 0) {
-        printf("Failed to read file '%s': %d\n", full_path, (int)res);
-        free(buffer);
-        lfs_file_close(&lfs, &file);
-        return res;
-    }
-    
-    buffer[res] = '\0';
-    printf("Contents of %s (%d bytes):\n", full_path, (int)res);
-    printf("%s", buffer);
-    if (res > 0 && buffer[res-1] != '\n') {
-        printf("\n");  // Add newline if content doesn't end with one
-    }
-    
-    free(buffer);
-    err = lfs_file_close(&lfs, &file);
-    if (err) {
-        printf("Failed to close file '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    return 0;
-}
-
-static int cmd_rm(const char *path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    // Handle relative path by prepending current path if not in root directory
-    char full_path[1024];
-    if (path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_path, sizeof(full_path) - 1, "/%s", path);
-            full_path[sizeof(full_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_path, sizeof(full_path) - 1, "%s/%s", current_path, path);
-            if (len >= sizeof(full_path) - 1) {
-                printf("Path too long: %s\n", full_path);
-                return -1;
-            }
-        }
-    }
-    
-    int err = lfs_remove(&lfs, full_path);
-    if (err) {
-        printf("Failed to remove '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    printf("Removed: %s\n", full_path);
-    return 0;
-}
-
-static int cmd_mkdir(const char *path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    // Handle relative path by prepending current path if not in root directory
-    char full_path[1024];
-    if (path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_path, sizeof(full_path) - 1, "/%s", path);
-            full_path[sizeof(full_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_path, sizeof(full_path) - 1, "%s/%s", current_path, path);
-            if (len >= sizeof(full_path) - 1) {
-                printf("Path too long: %s\n", full_path);
-                return -1;
-            }
-        }
-    }
-    
-    int err = lfs_mkdir(&lfs, full_path);
-    if (err) {
-        printf("Failed to create directory '%s': %d\n", full_path, err);
-        return err;
-    }
-    
-    printf("Created directory: %s\n", full_path);
-    return 0;
-}
-
-static int cmd_rename(const char *old_path, const char *new_path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    if (!old_path || !new_path) {
-        printf("Old path and new path must be provided\n");
-        return -1;
-    }
-    
-    // Handle relative paths by prepending current path if not in root directory
-    char full_old_path[1024];
-    char full_new_path[1024];
-    
-    // Process old_path
-    if (old_path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_old_path, old_path, sizeof(full_old_path) - 1);
-        full_old_path[sizeof(full_old_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_old_path, sizeof(full_old_path) - 1, "/%s", old_path);
-            full_old_path[sizeof(full_old_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_old_path, sizeof(full_old_path) - 1, "%s/%s", current_path, old_path);
-            if (len >= sizeof(full_old_path) - 1) {
-                printf("Path too long: %s\n", full_old_path);
-                return -1;
-            }
-        }
-    }
-    
-    // Process new_path
-    if (new_path[0] == '/') {
-        // Absolute path, use as-is
-        strncpy(full_new_path, new_path, sizeof(full_new_path) - 1);
-        full_new_path[sizeof(full_new_path) - 1] = '\0';
-    } else {
-        // Relative path, prepend current path
-        if (strcmp(current_path, "/") == 0) {
-            // In root directory, just add the path
-            snprintf(full_new_path, sizeof(full_new_path) - 1, "/%s", new_path);
-            full_new_path[sizeof(full_new_path) - 1] = '\0';
-        } else {
-            // In subdirectory, construct full path
-            int len = snprintf(full_new_path, sizeof(full_new_path) - 1, "%s/%s", current_path, new_path);
-            if (len >= sizeof(full_new_path) - 1) {
-                printf("Path too long: %s\n", full_new_path);
-                return -1;
-            }
-        }
-    }
-    
-    int err = lfs_rename(&lfs, full_old_path, full_new_path);
-    if (err) {
-        printf("Failed to rename '%s' to '%s': %d\n", full_old_path, full_new_path, err);
-        return err;
-    }
-    
-    printf("Renamed '%s' to '%s'\n", full_old_path, full_new_path);
-    return 0;
-}
-
-static int cmd_cd(const char *path) {
-    if (!mounted) {
-        printf("Filesystem not mounted\n");
-        return -1;
-    }
-    
-    if (!path || strlen(path) == 0) {
-        printf("Path not provided\n");
-        return -1;
-    }
-    
-    // Handle special case: cd ..
-    if (strcmp(path, "..") == 0) {
-        // Find last '/' and remove the last directory part
-        char *last_slash = strrchr(current_path, '/');
-        if (last_slash && last_slash != current_path) {
-            *(last_slash) = '\0';
-        } else if (last_slash && last_slash == current_path) {
-            // We're already at root
-            strcpy(current_path, "/");
-        } else {
-            // Should not happen for valid paths
-            strcpy(current_path, "/");
-        }
-        printf("Changed to parent directory: %s\n", current_path);
+        strcpy(output, "/");
         return 0;
     }
-    
-    // Handle absolute path (starts with /)
-    char new_path[1024];  // Increased size
-    if (path[0] == '/') {
-        strncpy(new_path, path, sizeof(new_path) - 1);
-        new_path[sizeof(new_path) - 1] = '\0';
-    } else {
-        // Handle relative path
-        if (strcmp(current_path, "/") == 0) {
-            snprintf(new_path, sizeof(new_path) - 1, "/%s", path);  // Ensure space for null terminator
-        } else {
-            int written = snprintf(new_path, sizeof(new_path) - 1, "%s/%s", current_path, path);
-            if (written < 0 || written >= (int)(sizeof(new_path) - 1)) {
-                printf("Path too long\n");
-                return -1;
-            }
+
+    size_t off = 0;
+    output[off++] = '/';
+    for (int i = 0; i < part_count; i++) {
+        size_t len = strlen(parts[i]);
+        if (off + len + 1 >= output_size) {
+            return -1;
         }
-        // Normalize the path by resolving .. and .
+        memcpy(&output[off], parts[i], len);
+        off += len;
+        if (i + 1 != part_count) {
+            output[off++] = '/';
+        }
     }
-    
-    // Check if the directory exists
-    struct lfs_info info;
-    int err = lfs_stat(&lfs, new_path, &info);
-    if (err) {
-        printf("Directory '%s' does not exist\n", new_path);
-        return err;
-    }
-    
-    if (info.type != LFS_TYPE_DIR) {
-        printf("'%s' is not a directory\n", new_path);
-        return -1;
-    }
-    
-    strncpy(current_path, new_path, sizeof(current_path) - 1);
-    current_path[sizeof(current_path) - 1] = '\0';
-    printf("Changed directory to: %s\n", current_path);
+    output[off] = '\0';
     return 0;
 }
 
-static int cmd_pwd() {
-    printf("%s\n", current_path);
+static char *join_args(int argc, char **argv, int start) {
+    size_t len = 1;
+    for (int i = start; i < argc; i++) {
+        len += strlen(argv[i]) + 1;
+    }
+
+    char *result = malloc(len);
+    if (!result) {
+        return NULL;
+    }
+
+    result[0] = '\0';
+    for (int i = start; i < argc; i++) {
+        if (i != start) {
+            strcat(result, " ");
+        }
+        strcat(result, argv[i]);
+    }
+    return result;
+}
+
+static int split_command(char *line, char **argv, int max_args) {
+    int argc = 0;
+    char *p = line;
+
+    while (*p != '\0' && argc < max_args) {
+        while (isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            argv[argc++] = p;
+            while (*p != '\0' && *p != quote) {
+                if (*p == '\\' && p[1] != '\0') {
+                    memmove(p, p+1, strlen(p));
+                }
+                p++;
+            }
+            if (*p == quote) {
+                *p++ = '\0';
+            }
+        } else {
+            argv[argc++] = p;
+            while (*p != '\0' && !isspace((unsigned char)*p)) {
+                p++;
+            }
+            if (*p != '\0') {
+                *p++ = '\0';
+            }
+        }
+    }
+
+    return argc;
+}
+
+static char *trim_whitespace(char *text) {
+    while (isspace((unsigned char)*text)) {
+        text++;
+    }
+
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    *end = '\0';
+    return text;
+}
+
+static int cmd_help(sim_state_t *sim, int argc, char **argv) {
+    (void)sim;
+    (void)argc;
+    (void)argv;
+    print_help();
     return 0;
+}
+
+static int ensure_mounted(sim_state_t *sim) {
+    if (!sim->mounted) {
+        fprintf(stderr, "Filesystem is not mounted.\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_ls(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim)) {
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    const char *target = (argc >= 2) ? argv[1] : sim->current_path;
+    if (resolve_path(sim, target, path, sizeof(path))) {
+        fprintf(stderr, "Invalid path.\n");
+        return -1;
+    }
+
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err) {
+        fprintf(stderr, "ls: failed to open %s: %d\n", path, err);
+        return err;
+    }
+
+    printf("Listing %s\n", path);
+    printf("%-6s %-10s %s\n", "TYPE", "SIZE", "NAME");
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+        printf("%-6s %-10"PRIu32" %s\n",
+                (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE",
+                (uint32_t)info.size,
+                info.name);
+    }
+
+    lfs_dir_close(&sim->lfs, &dir);
+    return (err < 0) ? err : 0;
+}
+
+static int cmd_cd(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "cd: invalid path\n");
+        return -1;
+    }
+
+    struct lfs_info info;
+    int err = lfs_stat(&sim->lfs, path, &info);
+    if (err) {
+        fprintf(stderr, "cd: %s: %d\n", path, err);
+        return err;
+    }
+    if (info.type != LFS_TYPE_DIR) {
+        fprintf(stderr, "cd: not a directory: %s\n", path);
+        return -1;
+    }
+
+    strncpy(sim->current_path, path, sizeof(sim->current_path)-1);
+    sim->current_path[sizeof(sim->current_path)-1] = '\0';
+    return 0;
+}
+
+static int cmd_pwd(sim_state_t *sim, int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    printf("%s\n", sim->current_path);
+    return 0;
+}
+
+static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer, lfs_size_t *size) {
+    struct lfs_info info;
+    int err = lfs_stat(&sim->lfs, path, &info);
+    if (err) {
+        return err;
+    }
+    if (info.type != LFS_TYPE_REG) {
+        return LFS_ERR_ISDIR;
+    }
+
+    *buffer = malloc(info.size ? info.size : 1);
+    if (!*buffer) {
+        return LFS_ERR_NOMEM;
+    }
+
+    lfs_file_t file;
+    err = lfs_file_open(&sim->lfs, &file, path, LFS_O_RDONLY);
+    if (err) {
+        free(*buffer);
+        *buffer = NULL;
+        return err;
+    }
+
+    lfs_ssize_t res = lfs_file_read(&sim->lfs, &file, *buffer, info.size);
+    lfs_file_close(&sim->lfs, &file);
+    if (res < 0) {
+        free(*buffer);
+        *buffer = NULL;
+        return (int)res;
+    }
+
+    *size = (lfs_size_t)res;
+    return 0;
+}
+
+static int read_device_bytes(
+        sim_state_t *sim, uint64_t offset, void *buffer, size_t size) {
+    uint8_t *cursor = buffer;
+    size_t remaining = size;
+
+    off_t pos = lseek(sim->bd.fd, (off_t)offset, SEEK_SET);
+    if (pos < 0) {
+        int err = -errno;
+        fprintf(stderr, "device read seek failed at 0x%"PRIx64": %d\n",
+                offset, err);
+        return err;
+    }
+
+    while (remaining > 0) {
+        ssize_t res = read(sim->bd.fd, cursor, remaining);
+        if (res < 0) {
+            int err = -errno;
+            fprintf(stderr, "device read failed at 0x%"PRIx64": %d\n",
+                    offset + (uint64_t)(cursor - (uint8_t*)buffer), err);
+            return err;
+        }
+        if (res == 0) {
+            memset(cursor, 0xff, remaining);
+            break;
+        }
+
+        cursor += res;
+        remaining -= (size_t)res;
+    }
+
+    return 0;
+}
+
+static int read_device_block(
+        sim_state_t *sim, lfs_block_t block, uint8_t *buffer) {
+    if (block >= sim->storage.block_count) {
+        fprintf(stderr, "block out of range: %"PRIu32"\n", block);
+        return -1;
+    }
+
+    return read_device_bytes(sim,
+            (uint64_t)block * sim->storage.block_size,
+            buffer, sim->storage.block_size);
+}
+
+static int cmd_cat(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "cat: invalid path\n");
+        return -1;
+    }
+
+    uint8_t *buffer = NULL;
+    lfs_size_t size = 0;
+    int err = read_file_alloc(sim, path, &buffer, &size);
+    if (err) {
+        fprintf(stderr, "cat: %s: %d\n", path, err);
+        return err;
+    }
+
+    fwrite(buffer, 1, size, stdout);
+    if (size == 0 || buffer[size-1] != '\n') {
+        putchar('\n');
+    }
+    free(buffer);
+    return 0;
+}
+
+static void print_hexdump_with_base(
+        const uint8_t *data, size_t size, uint32_t base_offset) {
+    for (size_t i = 0; i < size; i += 16) {
+        printf("%08"PRIx32"  ", base_offset + (uint32_t)i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i+j < size) {
+                printf("%02x ", data[i+j]);
+            } else {
+                printf("   ");
+            }
+        }
+        printf(" ");
+        for (size_t j = 0; j < 16 && i+j < size; j++) {
+            uint8_t c = data[i+j];
+            putchar(isprint(c) ? c : '.');
+        }
+        putchar('\n');
+    }
+}
+
+static void print_hexdump(const uint8_t *data, size_t size) {
+    print_hexdump_with_base(data, size, 0);
+}
+
+static void print_erased_block_preview(size_t block_size) {
+    uint8_t line[32];
+    memset(line, 0xff, sizeof(line));
+    print_hexdump_with_base(line, sizeof(line), 0);
+    if (block_size > sizeof(line)) {
+        printf("... erased block omitted (%zu bytes total)\n", block_size);
+    }
+}
+
+static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size) {
+    size_t end = block_size;
+    while (end > 0 && buffer[end - 1] == 0xff) {
+        end--;
+    }
+
+    if (end == 0) {
+        return 0;
+    }
+
+    // Round up to a full hexdump row so the final line stays aligned.
+    size_t rounded = ((end + 15) / 16) * 16;
+    return lfs_min(rounded, block_size);
+}
+
+static int inspect_mark_used_block(void *data, lfs_block_t block) {
+    block_usage_map_t *map = data;
+    if (block < map->count) {
+        map->used[block] = 1;
+    }
+    return 0;
+}
+
+static bool buffer_is_erased(const uint8_t *buffer, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        if (buffer[i] != 0xff) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *meta_tag_type_name(uint16_t type) {
+    switch (type) {
+    case LFS_TYPE_REG:
+        return "reg";
+    case LFS_TYPE_DIR:
+        return "dir";
+    case LFS_TYPE_SUPERBLOCK:
+        return "superblock";
+    case LFS_TYPE_DIRSTRUCT:
+        return "dirstruct";
+    case LFS_TYPE_INLINESTRUCT:
+        return "inlinestruct";
+    case LFS_TYPE_CTZSTRUCT:
+        return "ctzstruct";
+    case LFS_TYPE_SOFTTAIL:
+        return "softtail";
+    case LFS_TYPE_HARDTAIL:
+        return "hardtail";
+    case LFS_TYPE_MOVESTATE:
+        return "movestate";
+    case LFS_TYPE_CREATE:
+        return "create";
+    case LFS_TYPE_DELETE:
+        return "delete";
+    case LFS_TYPE_FCRC:
+        return "fcrc";
+    default:
+        break;
+    }
+
+    if ((type & 0x700) == LFS_TYPE_NAME) {
+        return "name";
+    }
+    if ((type & 0x700) == LFS_TYPE_STRUCT) {
+        return "struct";
+    }
+    if ((type & 0x700) == LFS_TYPE_USERATTR) {
+        return "userattr";
+    }
+    if ((type & 0x700) == LFS_TYPE_TAIL) {
+        return "tail";
+    }
+    if ((type & 0x700) == LFS_TYPE_GLOBALS) {
+        return "gstate";
+    }
+    if ((type & 0x700) == LFS_TYPE_CRC) {
+        return "crc";
+    }
+    if ((type & 0x700) == LFS_TYPE_SPLICE) {
+        return "splice";
+    }
+
+    return "unknown";
+}
+
+static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t size) {
+    bool show_ascii = (type == LFS_TYPE_REG || type == LFS_TYPE_DIR ||
+            type == LFS_TYPE_SUPERBLOCK || (type & 0x700) == LFS_TYPE_NAME);
+    if (show_ascii && size > 0) {
+        printf(" data=\"");
+        for (lfs_size_t i = 0; i < size; i++) {
+            uint8_t c = data[i];
+            if (isprint(c) && c != '"' && c != '\\') {
+                putchar(c);
+            } else {
+                printf("\\x%02x", c);
+            }
+        }
+        printf("\"");
+        return;
+    }
+
+    if ((type == LFS_TYPE_DIRSTRUCT || type == LFS_TYPE_SOFTTAIL ||
+            type == LFS_TYPE_HARDTAIL || type == LFS_TYPE_MOVESTATE) &&
+            size >= 8) {
+        uint32_t pair0;
+        uint32_t pair1;
+        memcpy(&pair0, data, sizeof(pair0));
+        memcpy(&pair1, data + 4, sizeof(pair1));
+        printf(" pair={0x%"PRIx32",0x%"PRIx32"}",
+                lfs_fromle32(pair0), lfs_fromle32(pair1));
+        return;
+    }
+
+    if (type == LFS_TYPE_CTZSTRUCT && size >= 8) {
+        uint32_t head;
+        uint32_t bytes;
+        memcpy(&head, data, sizeof(head));
+        memcpy(&bytes, data + 4, sizeof(bytes));
+        printf(" ctz={head=0x%"PRIx32", size=%"PRIu32"}",
+                lfs_fromle32(head), lfs_fromle32(bytes));
+        return;
+    }
+
+    if ((type == LFS_TYPE_CCRC || type == LFS_TYPE_FCRC) && size >= 4) {
+        uint32_t crc;
+        memcpy(&crc, data, sizeof(crc));
+        printf(" value=0x%08"PRIx32, lfs_fromle32(crc));
+        return;
+    }
+
+    if (size == 0) {
+        return;
+    }
+
+    printf(" data=");
+    lfs_size_t limit = lfs_min(size, (lfs_size_t)16);
+    for (lfs_size_t i = 0; i < limit; i++) {
+        printf("%02x", data[i]);
+    }
+    if (size > limit) {
+        printf("...");
+    }
+}
+
+static int cmd_hexdump(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "hexdump: invalid path\n");
+        return -1;
+    }
+
+    uint8_t *buffer = NULL;
+    lfs_size_t size = 0;
+    int err = read_file_alloc(sim, path, &buffer, &size);
+    if (err) {
+        fprintf(stderr, "hexdump: %s: %d\n", path, err);
+        return err;
+    }
+
+    print_hexdump(buffer, size);
+    free(buffer);
+    return 0;
+}
+
+static int cmd_create_file(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: create <file>\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "create: invalid path\n");
+        return -1;
+    }
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path, LFS_O_CREAT | LFS_O_WRONLY);
+    if (err) {
+        fprintf(stderr, "create: failed to open %s: %d\n", path, err);
+        return err;
+    }
+
+    err = lfs_file_close(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "create: failed to close %s: %d\n", path, err);
+        return err;
+    }
+
+    return 0;
+}
+
+static int cmd_write(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 3) {
+        fprintf(stderr, "usage: write <file> <data>\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "write: invalid path\n");
+        return -1;
+    }
+
+    char *data = join_args(argc, argv, 2);
+    if (!data) {
+        fprintf(stderr, "write: out of memory\n");
+        return -1;
+    }
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        fprintf(stderr, "write: failed to open %s: %d\n", path, err);
+        free(data);
+        return err;
+    }
+
+    lfs_ssize_t res = lfs_file_write(&sim->lfs, &file, data, strlen(data));
+    if (res < 0) {
+        fprintf(stderr, "write: failed to write %s: %d\n", path, (int)res);
+        lfs_file_close(&sim->lfs, &file);
+        free(data);
+        return (int)res;
+    }
+
+    err = lfs_file_close(&sim->lfs, &file);
+    free(data);
+    if (err) {
+        fprintf(stderr, "write: failed to close %s: %d\n", path, err);
+        return err;
+    }
+
+    printf("Wrote %d bytes to %s\n", (int)res, path);
+    return 0;
+}
+
+static int cmd_mkdir(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: mkdir <dir>\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "mkdir: invalid path\n");
+        return -1;
+    }
+
+    int err = lfs_mkdir(&sim->lfs, path);
+    if (err) {
+        fprintf(stderr, "mkdir: %s: %d\n", path, err);
+        return err;
+    }
+    return 0;
+}
+
+static int remove_path_recursive(sim_state_t *sim, const char *path) {
+    struct lfs_info info;
+    int err = lfs_stat(&sim->lfs, path, &info);
+    if (err) {
+        return err;
+    }
+
+    if (info.type == LFS_TYPE_DIR) {
+        lfs_dir_t dir;
+        err = lfs_dir_open(&sim->lfs, &dir, path);
+        if (err) {
+            return err;
+        }
+
+        struct lfs_info child;
+        while ((err = lfs_dir_read(&sim->lfs, &dir, &child)) > 0) {
+            if (strcmp(child.name, ".") == 0 || strcmp(child.name, "..") == 0) {
+                continue;
+            }
+
+            char child_path[SIM_PATH_MAX];
+            if (strcmp(path, "/") == 0) {
+                snprintf(child_path, sizeof(child_path), "/%s", child.name);
+            } else {
+                snprintf(child_path, sizeof(child_path), "%s/%s", path, child.name);
+            }
+
+            err = remove_path_recursive(sim, child_path);
+            if (err) {
+                lfs_dir_close(&sim->lfs, &dir);
+                return err;
+            }
+        }
+
+        lfs_dir_close(&sim->lfs, &dir);
+        if (err < 0) {
+            return err;
+        }
+    }
+
+    return lfs_remove(&sim->lfs, path);
+}
+
+static int cmd_rm(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: rm <path> [--recursive]\n");
+        return -1;
+    }
+
+    bool recursive = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--recursive") == 0) {
+            recursive = true;
+        }
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "rm: invalid path\n");
+        return -1;
+    }
+
+    int err = recursive ? remove_path_recursive(sim, path) : lfs_remove(&sim->lfs, path);
+    if (err) {
+        fprintf(stderr, "rm: %s: %d\n", path, err);
+        return err;
+    }
+    return 0;
+}
+
+static int cmd_cp(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 3) {
+        fprintf(stderr, "usage: cp <src> <dst>\n");
+        return -1;
+    }
+
+    char src[SIM_PATH_MAX];
+    char dst[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], src, sizeof(src)) ||
+            resolve_path(sim, argv[2], dst, sizeof(dst))) {
+        fprintf(stderr, "cp: invalid path\n");
+        return -1;
+    }
+
+    lfs_file_t in;
+    lfs_file_t out;
+    int err = lfs_file_open(&sim->lfs, &in, src, LFS_O_RDONLY);
+    if (err) {
+        fprintf(stderr, "cp: failed to open %s: %d\n", src, err);
+        return err;
+    }
+
+    err = lfs_file_open(&sim->lfs, &out, dst,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        fprintf(stderr, "cp: failed to open %s: %d\n", dst, err);
+        lfs_file_close(&sim->lfs, &in);
+        return err;
+    }
+
+    uint8_t buffer[SIM_READ_CHUNK];
+    while (true) {
+        lfs_ssize_t res = lfs_file_read(&sim->lfs, &in, buffer, sizeof(buffer));
+        if (res < 0) {
+            err = (int)res;
+            break;
+        }
+        if (res == 0) {
+            break;
+        }
+
+        lfs_ssize_t written = lfs_file_write(&sim->lfs, &out, buffer, res);
+        if (written < 0 || written != res) {
+            err = (written < 0) ? (int)written : -1;
+            break;
+        }
+    }
+
+    lfs_file_close(&sim->lfs, &in);
+    lfs_file_close(&sim->lfs, &out);
+
+    if (err) {
+        fprintf(stderr, "cp: failed while copying %s -> %s: %d\n", src, dst, err);
+        return err;
+    }
+    return 0;
+}
+
+static int cmd_rename(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 3) {
+        fprintf(stderr, "usage: rename <src> <dst>\n");
+        return -1;
+    }
+
+    char src[SIM_PATH_MAX];
+    char dst[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], src, sizeof(src)) ||
+            resolve_path(sim, argv[2], dst, sizeof(dst))) {
+        fprintf(stderr, "rename: invalid path\n");
+        return -1;
+    }
+
+    int err = lfs_rename(&sim->lfs, src, dst);
+    if (err) {
+        fprintf(stderr, "rename: %s -> %s: %d\n", src, dst, err);
+        return err;
+    }
+
+    return 0;
+}
+
+static int cmd_stat(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: stat <path>\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "stat: invalid path\n");
+        return -1;
+    }
+
+    struct lfs_info info;
+    int err = lfs_stat(&sim->lfs, path, &info);
+    if (err) {
+        fprintf(stderr, "stat: %s: %d\n", path, err);
+        return err;
+    }
+
+    printf("path : %s\n", path);
+    printf("type : %s\n", (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE");
+    printf("size : %"PRIu32"\n", (uint32_t)info.size);
+    return 0;
+}
+
+static int cmd_mount(sim_state_t *sim, int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    return sim_mount(sim);
+}
+
+static int cmd_umount(sim_state_t *sim, int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    return sim_unmount(sim);
+}
+
+static int cmd_format(sim_state_t *sim, int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    return sim_format(sim);
+}
+
+static int tree_walk(sim_state_t *sim, const char *path, int level, int max_depth,
+        tree_stats_t *stats) {
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err) {
+        printf("%*s[CORRUPTED] %s (%d)\n", (level + 1) * 2, "", path, err);
+        stats->corrupted++;
+        return err;
+    }
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        char child[SIM_PATH_MAX];
+        if (strcmp(path, "/") == 0) {
+            snprintf(child, sizeof(child), "/%s", info.name);
+        } else {
+            snprintf(child, sizeof(child), "%s/%s", path, info.name);
+        }
+
+        printf("%*s|- %s%s", (level + 1) * 2, "",
+                info.name,
+                (info.type == LFS_TYPE_DIR) ? "/" : "");
+        if (info.type == LFS_TYPE_REG) {
+            printf(" (%"PRIu32" B)", (uint32_t)info.size);
+            stats->files++;
+            stats->total_bytes += info.size;
+        } else {
+            stats->dirs++;
+        }
+        printf("\n");
+
+        if (info.type == LFS_TYPE_DIR &&
+                (max_depth < 0 || level < max_depth)) {
+            tree_walk(sim, child, level + 1, max_depth, stats);
+        }
+    }
+
+    lfs_dir_close(&sim->lfs, &dir);
+    return (err < 0) ? err : 0;
+}
+
+static int cmd_tree(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim)) {
+        return -1;
+    }
+
+    const char *target = sim->current_path;
+    int max_depth = -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--depth") == 0) {
+            lfs_size_t parsed = 0;
+            if (i + 1 >= argc || parse_size_arg(argv[++i], &parsed)) {
+                fprintf(stderr, "tree: --depth requires a non-negative value\n");
+                return -1;
+            }
+            max_depth = (int)parsed;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "tree: unknown option %s\n", argv[i]);
+            return -1;
+        } else if (target == sim->current_path) {
+            target = argv[i];
+        } else {
+            fprintf(stderr, "tree: unexpected argument %s\n", argv[i]);
+            return -1;
+        }
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, target, path, sizeof(path))) {
+        fprintf(stderr, "tree: invalid path\n");
+        return -1;
+    }
+
+    struct lfs_info info;
+    int err = lfs_stat(&sim->lfs, path, &info);
+    if (err) {
+        fprintf(stderr, "tree: %s: %d\n", path, err);
+        return err;
+    }
+    if (info.type != LFS_TYPE_DIR) {
+        fprintf(stderr, "tree: not a directory: %s\n", path);
+        return -1;
+    }
+
+    tree_stats_t stats = {0};
+    printf("%s\n", path);
+    err = tree_walk(sim, path, 0, max_depth, &stats);
+    printf("%d director%s, %d file%s, %"PRIu64" bytes",
+            stats.dirs, (stats.dirs == 1) ? "y" : "ies",
+            stats.files, (stats.files == 1) ? "" : "s",
+            stats.total_bytes);
+    if (stats.corrupted > 0) {
+        printf(", %d corrupted director%s",
+                stats.corrupted, (stats.corrupted == 1) ? "y" : "ies");
+    }
+    putchar('\n');
+    return err;
+}
+
+static int cmd_inspect(sim_state_t *sim, int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: inspect blocks | inspect block <N>\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "block") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "usage: inspect block <N>\n");
+            return -1;
+        }
+
+        lfs_size_t block_value = 0;
+        if (parse_size_arg(argv[2], &block_value)) {
+            fprintf(stderr, "inspect block: invalid block number %s\n", argv[2]);
+            return -1;
+        }
+        if (block_value >= sim->storage.block_count) {
+            fprintf(stderr, "inspect block: block %"PRIu32" out of range (max %"PRIu32")\n",
+                    (uint32_t)block_value, (uint32_t)(sim->storage.block_count - 1));
+            return -1;
+        }
+
+        uint8_t *buffer = malloc(sim->storage.block_size);
+        if (!buffer) {
+            fprintf(stderr, "inspect block: out of memory\n");
+            return -1;
+        }
+
+        int err = read_device_block(sim, (lfs_block_t)block_value, buffer);
+        if (err == 0) {
+            printf("Block %"PRIu32" (offset 0x%"PRIx64", %s)\n",
+                    (uint32_t)block_value,
+                    (uint64_t)block_value * sim->storage.block_size,
+                    buffer_is_erased(buffer, sim->storage.block_size) ? "erased" : "programmed");
+            print_hexdump(buffer, sim->storage.block_size);
+        }
+        free(buffer);
+        return err;
+    }
+
+    if (strcmp(argv[1], "blocks") == 0) {
+        if (ensure_mounted(sim)) {
+            return -1;
+        }
+
+        uint8_t *used = calloc(sim->storage.block_count, 1);
+        if (!used) {
+            fprintf(stderr, "inspect blocks: out of memory\n");
+            return -1;
+        }
+
+        block_usage_map_t map = {
+            .used = used,
+            .count = sim->storage.block_count,
+        };
+
+        int err = lfs_fs_traverse(&sim->lfs, inspect_mark_used_block, &map);
+        if (err) {
+            fprintf(stderr, "inspect blocks: traverse failed: %d\n", err);
+            free(used);
+            return err;
+        }
+
+        int used_count = 0;
+        printf("Block map (%"PRIu32" blocks, %"PRIu32" bytes/block)\n",
+                (uint32_t)sim->storage.block_count,
+                (uint32_t)sim->storage.block_size);
+        for (lfs_size_t i = 0; i < sim->storage.block_count; i++) {
+            putchar(used[i] ? '#' : '.');
+            if (used[i]) {
+                used_count++;
+            }
+            if ((i + 1) % 64 == 0 || i + 1 == sim->storage.block_count) {
+                putchar('\n');
+            }
+        }
+        printf("# = used, . = free\n");
+        printf("Used blocks: %d/%"PRIu32" (%.1f%%)\n",
+                used_count,
+                (uint32_t)sim->storage.block_count,
+                sim->storage.block_count ?
+                    (100.0 * used_count / sim->storage.block_count) : 0.0);
+
+        free(used);
+        return 0;
+    }
+
+    fprintf(stderr, "inspect: unknown subcommand %s\n", argv[1]);
+    return -1;
+}
+
+static int meta_dump_target(sim_state_t *sim, const char *path,
+        bool block_only, bool parsed_only) {
+    lfs_mdir_t mdir;
+    memset(&mdir, 0, sizeof(mdir));
+
+    bool has_entry = false;
+    uint16_t entry_id = 0;
+    uint8_t entry_type = 0;
+
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err == 0) {
+        mdir = dir.m;
+        entry_id = dir.id;
+        entry_type = dir.type;
+        has_entry = strcmp(path, "/") != 0;
+        lfs_dir_close(&sim->lfs, &dir);
+    } else {
+        lfs_file_t file;
+        err = lfs_file_open(&sim->lfs, &file, path, LFS_O_RDONLY);
+        if (err) {
+            fprintf(stderr, "meta-dump: failed to open %s: %d\n", path, err);
+            return err;
+        }
+        mdir = file.m;
+        entry_id = file.id;
+        entry_type = file.type;
+        has_entry = true;
+        lfs_file_close(&sim->lfs, &file);
+    }
+
+    uint8_t *block0 = malloc(sim->storage.block_size);
+    uint8_t *block1 = malloc(sim->storage.block_size);
+    if (!block0 || !block1) {
+        free(block0);
+        free(block1);
+        fprintf(stderr, "meta-dump: out of memory\n");
+        return -1;
+    }
+
+    err = read_device_block(sim, mdir.pair[0], block0);
+    if (err == 0) {
+        err = read_device_block(sim, mdir.pair[1], block1);
+    }
+    if (err) {
+        free(block0);
+        free(block1);
+        return err;
+    }
+
+    uint32_t rev0;
+    uint32_t rev1;
+    memcpy(&rev0, block0, sizeof(rev0));
+    memcpy(&rev1, block1, sizeof(rev1));
+    rev0 = lfs_fromle32(rev0);
+    rev1 = lfs_fromle32(rev1);
+
+    int active_index = 0;
+    if (rev1 == mdir.rev && rev0 != mdir.rev) {
+        active_index = 1;
+    } else if (rev0 != mdir.rev && rev1 != mdir.rev &&
+            lfs_scmp(rev1, rev0) > 0) {
+        active_index = 1;
+    }
+
+    printf("Metadata dump for %s\n", path);
+    printf("  pair     : {0x%"PRIx32", 0x%"PRIx32"}\n", mdir.pair[0], mdir.pair[1]);
+    printf("  active   : 0x%"PRIx32" (rev=%"PRIu32")\n",
+            mdir.pair[active_index], active_index == 0 ? rev0 : rev1);
+    printf("  mirror   : 0x%"PRIx32" (rev=%"PRIu32")\n",
+            mdir.pair[1 - active_index], active_index == 0 ? rev1 : rev0);
+    printf("  dir.rev  : %"PRIu32"\n", mdir.rev);
+    if (has_entry) {
+        printf("  entry    : id=%u type=%s\n", entry_id,
+                entry_type == LFS_TYPE_DIR ? "DIR" : "FILE");
+    }
+    putchar('\n');
+
+    const uint8_t *blocks[2] = {block0, block1};
+    const uint32_t revs[2] = {rev0, rev1};
+    for (int bi = 0; bi < 2; bi++) {
+        const uint8_t *block = blocks[bi];
+        printf("Block 0x%"PRIx32" [%s] revision=%"PRIu32"\n",
+                mdir.pair[bi], (bi == active_index) ? "ACTIVE" : "MIRROR", revs[bi]);
+
+        if (!parsed_only) {
+            if (buffer_is_erased(block, sim->storage.block_size)) {
+                print_erased_block_preview(sim->storage.block_size);
+            } else {
+                size_t dump_size = effective_block_dump_size(
+                        block, sim->storage.block_size);
+                print_hexdump(block, dump_size);
+                if (dump_size < sim->storage.block_size) {
+                    printf("... trailing erased area omitted (%zu bytes shown of %"PRIu32")\n",
+                            dump_size, (uint32_t)sim->storage.block_size);
+                }
+            }
+            putchar('\n');
+        }
+
+        if (!block_only) {
+            uint32_t prev_tag = 0xffffffffu;
+            uint32_t crc = lfs_crc(0xffffffffu, block, 4);
+            lfs_off_t off = 4;
+            int commit_index = 0;
+            int tag_index = 0;
+
+            while (off + 4 <= sim->storage.block_size) {
+                if (buffer_is_erased(block + off, sim->storage.block_size - off)) {
+                    break;
+                }
+
+                uint32_t raw_tag;
+                memcpy(&raw_tag, block + off, sizeof(raw_tag));
+                raw_tag = lfs_frombe32(raw_tag);
+
+                uint32_t decoded_tag = (prev_tag ^ raw_tag) & 0x7fffffffu;
+                uint16_t type = (decoded_tag & 0x7ff00000u) >> 20;
+                uint16_t id = (decoded_tag & 0x000ffc00u) >> 10;
+                uint16_t size = decoded_tag & 0x3ffu;
+                lfs_size_t dsize = 4 + ((size != 0x3ffu) ? size : 0);
+
+                if (off + dsize > sim->storage.block_size) {
+                    printf("  [TRUNCATED] off=0x%04"PRIx32" decoded=0x%08"PRIx32"\n",
+                            (uint32_t)off, decoded_tag);
+                    break;
+                }
+
+                const uint8_t *data = block + off + 4;
+                uint32_t crc_after = (type == LFS_TYPE_CCRC)
+                        ? lfs_crc(crc, block + off, 8)
+                        : lfs_crc(crc, block + off, dsize);
+
+                if (tag_index == 0) {
+                    printf("  commit #%d (offset 0x%04"PRIx32")\n",
+                            commit_index, (uint32_t)off);
+                }
+
+                printf("    [tag %d] off=0x%04"PRIx32" raw=0x%08"PRIx32
+                        " decoded=0x%08"PRIx32" type=%s id=%u size=%u",
+                        tag_index, (uint32_t)off, raw_tag, decoded_tag,
+                        meta_tag_type_name(type), id, size);
+                meta_print_tag_data(type, data, size == 0x3ffu ? 0 : size);
+                putchar('\n');
+
+                off += dsize;
+                tag_index++;
+
+                if (type == LFS_TYPE_CCRC) {
+                    crc = 0;
+                    prev_tag = decoded_tag ^ ((type & 1u) ? 0x80000000u : 0u);
+                    commit_index++;
+                    tag_index = 0;
+                } else {
+                    crc = crc_after;
+                    prev_tag = decoded_tag;
+                }
+            }
+            putchar('\n');
+        }
+    }
+
+    free(block0);
+    free(block1);
+    return 0;
+}
+
+static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: meta-dump <path> [--block-only] [--parsed-only]\n");
+        return -1;
+    }
+
+    const char *target = NULL;
+    bool block_only = false;
+    bool parsed_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--block-only") == 0) {
+            block_only = true;
+        } else if (strcmp(argv[i], "--parsed-only") == 0) {
+            parsed_only = true;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "meta-dump: unknown option %s\n", argv[i]);
+            return -1;
+        } else if (target == NULL) {
+            target = argv[i];
+        } else {
+            fprintf(stderr, "meta-dump: unexpected argument %s\n", argv[i]);
+            return -1;
+        }
+    }
+
+    if (target == NULL) {
+        fprintf(stderr, "meta-dump: missing path\n");
+        return -1;
+    }
+    if (block_only && parsed_only) {
+        fprintf(stderr, "meta-dump: choose only one of --block-only or --parsed-only\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, target, path, sizeof(path))) {
+        fprintf(stderr, "meta-dump: invalid path\n");
+        return -1;
+    }
+
+    return meta_dump_target(sim, path, block_only, parsed_only);
+}
+
+static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *should_exit) {
+    *should_exit = false;
+    if (argc == 0) {
+        return 0;
+    }
+
+    if (strcmp(argv[0], "help") == 0) {
+        return cmd_help(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "ls") == 0) {
+        return cmd_ls(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "cd") == 0) {
+        return cmd_cd(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "pwd") == 0) {
+        return cmd_pwd(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "cat") == 0) {
+        return cmd_cat(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "hexdump") == 0) {
+        return cmd_hexdump(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "create") == 0) {
+        return cmd_create_file(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "write") == 0) {
+        return cmd_write(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "mkdir") == 0) {
+        return cmd_mkdir(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "rm") == 0) {
+        return cmd_rm(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "cp") == 0) {
+        return cmd_cp(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "rename") == 0) {
+        return cmd_rename(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "stat") == 0) {
+        return cmd_stat(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "mount") == 0) {
+        return cmd_mount(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "umount") == 0) {
+        return cmd_umount(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "format") == 0) {
+        return cmd_format(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "tree") == 0) {
+        return cmd_tree(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "meta-dump") == 0) {
+        return cmd_meta_dump(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "inspect") == 0) {
+        return cmd_inspect(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "quit") == 0 || strcmp(argv[0], "exit") == 0) {
+        *should_exit = true;
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown command: %s\n", argv[0]);
+    return -1;
+}
+
+static int run_shell(sim_state_t *sim) {
+    char line[SIM_LINE_MAX];
+    char *argv[SIM_ARGV_MAX];
+
+    printf("Entering littlefs shell. Type 'help' for commands.\n");
+    while (true) {
+        printf("lfs> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            putchar('\n');
+            break;
+        }
+
+        char *trimmed = trim_whitespace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#') {
+            continue;
+        }
+
+        int argc = split_command(trimmed, argv, SIM_ARGV_MAX);
+        bool should_exit = false;
+        int err = dispatch_command(sim, argc, argv, &should_exit);
+        if (err) {
+            printf("[FAIL] %d\n", err);
+        }
+        if (should_exit) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int run_script(sim_state_t *sim, const char *script_path, bool stop_on_error) {
+    FILE *f = fopen(script_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open script %s: %s\n",
+                script_path, strerror(errno));
+        return -1;
+    }
+
+    char line[SIM_LINE_MAX];
+    int line_no = 0;
+    int total = 0;
+    int passed = 0;
+    int failed = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        char *trimmed = trim_whitespace(line);
+        if (trimmed[0] == '\0' || trimmed[0] == '#') {
+            continue;
+        }
+
+        char line_copy[SIM_LINE_MAX];
+        strncpy(line_copy, trimmed, sizeof(line_copy)-1);
+        line_copy[sizeof(line_copy)-1] = '\0';
+
+        char *argv[SIM_ARGV_MAX];
+        int argc = split_command(trimmed, argv, SIM_ARGV_MAX);
+        bool should_exit = false;
+        total++;
+
+        printf("[%d] %s\n", line_no, line_copy);
+        int err = dispatch_command(sim, argc, argv, &should_exit);
+        if (err) {
+            failed++;
+            printf("[FAIL] line %d -> %d\n", line_no, err);
+            if (stop_on_error) {
+                break;
+            }
+        } else {
+            passed++;
+        }
+
+        if (should_exit) {
+            break;
+        }
+    }
+
+    fclose(f);
+
+    printf("=== Script Summary ===\n");
+    printf("Total commands : %d\n", total);
+    printf("Passed         : %d\n", passed);
+    printf("Failed         : %d\n", failed);
+
+    return failed ? -1 : 0;
 }
