@@ -97,6 +97,22 @@ typedef struct block_usage_map {
     lfs_size_t count;
 } block_usage_map_t;
 
+typedef enum lschk_status {
+    LSCHK_STATUS_REAL = 0,
+    LSCHK_STATUS_GHOST,
+    LSCHK_STATUS_DAMAGED,
+} lschk_status_t;
+
+typedef struct lschk_entry {
+    char name[LFS_NAME_MAX+1];
+    uint8_t type;
+    lfs_size_t size;
+    lfs_block_t pair[2];
+    uint16_t id;
+    bool duplicate;
+    lschk_status_t status;
+} lschk_entry_t;
+
 static char g_exe_dir[SIM_PATH_MAX];
 
 static void print_help(void);
@@ -139,6 +155,7 @@ static char *trim_whitespace(char *text);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
+static int cmd_lschk(sim_state_t *sim, int argc, char **argv);
 static int cmd_cd(sim_state_t *sim, int argc, char **argv);
 static int cmd_pwd(sim_state_t *sim, int argc, char **argv);
 static int cmd_cat(sim_state_t *sim, int argc, char **argv);
@@ -181,6 +198,10 @@ static const char *meta_tag_type_name(uint16_t type);
 static void fmeta_print_tag_data(
         FILE *out, uint16_t type, const uint8_t *data, lfs_size_t size);
 static bool buffer_is_erased(const uint8_t *buffer, size_t size);
+static const char *lschk_status_name(lschk_status_t status);
+static bool pair_equals(const lfs_block_t a[2], const lfs_block_t b[2]);
+static int build_child_path(
+        const char *dir_path, const char *name, char *buffer, size_t buffer_size);
 static void build_default_meta_dump_name(
         const char *path, char *buffer, size_t buffer_size);
 static void resolve_export_path(
@@ -310,6 +331,7 @@ static void print_help(void) {
     printf("\n");
     printf("Shell commands:\n");
     printf("  ls [path]\n");
+    printf("  lschk [path]\n");
     printf("  cd <path>\n");
     printf("  pwd\n");
     printf("  cat <file>\n");
@@ -950,6 +972,34 @@ static int resolve_path(
     return 0;
 }
 
+static bool pair_equals(const lfs_block_t a[2], const lfs_block_t b[2]) {
+    return a[0] == b[0] && a[1] == b[1];
+}
+
+static int build_child_path(
+        const char *dir_path, const char *name, char *buffer, size_t buffer_size) {
+    if (strcmp(dir_path, "/") == 0) {
+        return snprintf(buffer, buffer_size, "/%s", name) < (int)buffer_size
+                ? 0 : -1;
+    }
+
+    return snprintf(buffer, buffer_size, "%s/%s", dir_path, name) < (int)buffer_size
+            ? 0 : -1;
+}
+
+static const char *lschk_status_name(lschk_status_t status) {
+    switch (status) {
+    case LSCHK_STATUS_REAL:
+        return "realfile";
+    case LSCHK_STATUS_GHOST:
+        return "ghostfile";
+    case LSCHK_STATUS_DAMAGED:
+        return "crashfile";
+    default:
+        return "unknown";
+    }
+}
+
 static char *join_args(int argc, char **argv, int start) {
     size_t len = 1;
     for (int i = start; i < argc; i++) {
@@ -1073,6 +1123,186 @@ static int cmd_ls(sim_state_t *sim, int argc, char **argv) {
 
     lfs_dir_close(&sim->lfs, &dir);
     return (err < 0) ? err : 0;
+}
+
+static int cmd_lschk(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim)) {
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    const char *target = (argc >= 2) ? argv[1] : sim->current_path;
+    if (resolve_path(sim, target, path, sizeof(path))) {
+        fprintf(stderr, "Invalid path.\n");
+        return -1;
+    }
+
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err) {
+        fprintf(stderr, "lschk: failed to open %s: %d\n", path, err);
+        return err;
+    }
+
+    lschk_entry_t *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 16;
+            lschk_entry_t *next = realloc(entries, new_capacity * sizeof(*entries));
+            if (!next) {
+                free(entries);
+                lfs_dir_close(&sim->lfs, &dir);
+                fprintf(stderr, "lschk: out of memory\n");
+                return -1;
+            }
+            entries = next;
+            capacity = new_capacity;
+        }
+
+        lschk_entry_t *entry = &entries[count++];
+        memset(entry, 0, sizeof(*entry));
+        strncpy(entry->name, info.name, sizeof(entry->name) - 1);
+        entry->type = info.type;
+        entry->size = info.size;
+        entry->pair[0] = dir.m.pair[0];
+        entry->pair[1] = dir.m.pair[1];
+        entry->id = (dir.id > 0) ? (uint16_t)(dir.id - 1) : 0;
+        entry->status = LSCHK_STATUS_REAL;
+    }
+
+    lfs_dir_close(&sim->lfs, &dir);
+    if (err < 0) {
+        free(entries);
+        return err;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            if (strcmp(entries[i].name, entries[j].name) == 0) {
+                entries[i].duplicate = true;
+                entries[j].duplicate = true;
+            }
+        }
+    }
+
+    bool *processed = calloc(count ? count : 1, sizeof(bool));
+    if (!processed) {
+        free(entries);
+        fprintf(stderr, "lschk: out of memory\n");
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (processed[i]) {
+            continue;
+        }
+
+        char child_path[SIM_PATH_MAX];
+        if (build_child_path(path, entries[i].name, child_path, sizeof(child_path))) {
+            entries[i].status = LSCHK_STATUS_DAMAGED;
+            processed[i] = true;
+            continue;
+        }
+
+        bool winner_found = false;
+        bool winner_is_file = false;
+        lfs_block_t winner_pair[2] = {0, 0};
+        uint16_t winner_id = 0;
+        uint8_t winner_type = 0;
+        int winner_index = -1;
+
+        lfs_file_t file;
+        int open_err = lfs_file_open(&sim->lfs, &file, child_path, LFS_O_RDONLY);
+        if (open_err == 0) {
+            winner_found = true;
+            winner_is_file = true;
+            winner_pair[0] = file.m.pair[0];
+            winner_pair[1] = file.m.pair[1];
+            winner_id = file.id;
+            winner_type = file.type;
+            lfs_file_close(&sim->lfs, &file);
+        } else {
+            lfs_dir_t child_dir;
+            open_err = lfs_dir_open(&sim->lfs, &child_dir, child_path);
+            if (open_err == 0) {
+                winner_found = true;
+                winner_type = LFS_TYPE_DIR;
+                lfs_dir_close(&sim->lfs, &child_dir);
+            }
+        }
+
+        if (winner_found && !winner_is_file && entries[i].duplicate) {
+            for (size_t j = i; j < count; j++) {
+                if (strcmp(entries[i].name, entries[j].name) == 0 &&
+                        entries[j].type == winner_type) {
+                    winner_index = (int)j;
+                    break;
+                }
+            }
+        }
+
+        for (size_t j = i; j < count; j++) {
+            if (strcmp(entries[i].name, entries[j].name) != 0) {
+                continue;
+            }
+
+            processed[j] = true;
+            if (!winner_found) {
+                entries[j].status = LSCHK_STATUS_DAMAGED;
+                continue;
+            }
+
+            if (!entries[j].duplicate) {
+                entries[j].status = LSCHK_STATUS_REAL;
+                continue;
+            }
+
+            if (winner_is_file) {
+                if (entries[j].type == winner_type &&
+                        entries[j].id == winner_id &&
+                        pair_equals(entries[j].pair, winner_pair)) {
+                    entries[j].status = LSCHK_STATUS_REAL;
+                } else if (entries[j].type == winner_type) {
+                    entries[j].status = LSCHK_STATUS_GHOST;
+                } else {
+                    entries[j].status = LSCHK_STATUS_DAMAGED;
+                }
+            } else {
+                if ((int)j == winner_index) {
+                    entries[j].status = LSCHK_STATUS_REAL;
+                } else if (entries[j].type == winner_type) {
+                    entries[j].status = LSCHK_STATUS_GHOST;
+                } else {
+                    entries[j].status = LSCHK_STATUS_DAMAGED;
+                }
+            }
+        }
+    }
+
+    printf("Checking %s\n", path);
+    printf("%-6s %-10s %s\n", "TYPE", "SIZE", "NAME");
+    for (size_t i = 0; i < count; i++) {
+        printf("%-6s %-10"PRIu32" %s [%s] id=%u pair={0x%"PRIx32",0x%"PRIx32"}\n",
+                (entries[i].type == LFS_TYPE_DIR) ? "DIR" : "FILE",
+                (uint32_t)entries[i].size,
+                entries[i].name,
+                lschk_status_name(entries[i].status),
+                entries[i].id,
+                entries[i].pair[0],
+                entries[i].pair[1]);
+    }
+
+    free(processed);
+    free(entries);
+    return 0;
 }
 
 static int cmd_cd(sim_state_t *sim, int argc, char **argv) {
@@ -2231,6 +2461,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "ls") == 0) {
         return cmd_ls(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "lschk") == 0) {
+        return cmd_lschk(sim, argc, argv);
     }
     if (strcmp(argv[0], "cd") == 0) {
         return cmd_cd(sim, argc, argv);
