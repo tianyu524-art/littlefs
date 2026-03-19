@@ -180,6 +180,7 @@ static const char *meta_tag_type_name(uint16_t type);
 static void fmeta_print_tag_data(
         FILE *out, uint16_t type, const uint8_t *data, lfs_size_t size);
 static bool buffer_is_erased(const uint8_t *buffer, size_t size);
+static bool meta_type_is_crc(uint16_t type);
 static void build_default_meta_dump_name(
         const char *path, char *buffer, size_t buffer_size);
 static void resolve_export_path(
@@ -799,10 +800,7 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
         return -1;
     }
 
-    sim->bd_cfg.read_size = sim->storage.read_size;
-    sim->bd_cfg.prog_size = sim->storage.prog_size;
-    sim->bd_cfg.erase_size = sim->storage.block_size;
-    sim->bd_cfg.erase_count = sim->storage.block_count;
+    sim->bd_cfg.erase_value = 0xff;
 
     sim->cfg.context = &sim->bd;
     sim->cfg.read = lfs_filebd_read;
@@ -823,9 +821,8 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->cfg.file_max = LFS_FILE_MAX;
     sim->cfg.attr_max = LFS_ATTR_MAX;
     sim->cfg.metadata_max = sim->storage.block_size;
-    sim->cfg.inline_max = 0;
 
-    int err = lfs_filebd_create(&sim->cfg, image_path, &sim->bd_cfg);
+    int err = lfs_filebd_createcfg(&sim->cfg, image_path, &sim->bd_cfg);
     if (err) {
         fprintf(stderr, "Failed to open block device %s: %d\n", image_path, err);
         return -1;
@@ -1364,8 +1361,6 @@ static const char *meta_tag_type_name(uint16_t type) {
         return "create";
     case LFS_TYPE_DELETE:
         return "delete";
-    case LFS_TYPE_FCRC:
-        return "fcrc";
     default:
         break;
     }
@@ -1393,6 +1388,10 @@ static const char *meta_tag_type_name(uint16_t type) {
     }
 
     return "unknown";
+}
+
+static bool meta_type_is_crc(uint16_t type) {
+    return (type & 0x700u) == LFS_TYPE_CRC;
 }
 
 static void fmeta_print_tag_data(
@@ -1435,7 +1434,7 @@ static void fmeta_print_tag_data(
         return;
     }
 
-    if ((type == LFS_TYPE_CCRC || type == LFS_TYPE_FCRC) && size >= 4) {
+    if (meta_type_is_crc(type) && size >= 4) {
         uint32_t crc;
         memcpy(&crc, data, sizeof(crc));
         fprintf(out, " value=0x%08"PRIx32, lfs_fromle32(crc));
@@ -2096,7 +2095,7 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
                 }
 
                 const uint8_t *data = block + off + 4;
-                uint32_t crc_after = (type == LFS_TYPE_CCRC)
+                uint32_t crc_after = meta_type_is_crc(type)
                         ? lfs_crc(crc, block + off, 8)
                         : lfs_crc(crc, block + off, dsize);
 
@@ -2118,7 +2117,7 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
                 off += dsize;
                 tag_index++;
 
-                if (type == LFS_TYPE_CCRC) {
+                if (meta_type_is_crc(type)) {
                     crc = 0;
                     prev_tag = decoded_tag ^ ((type & 1u) ? 0x80000000u : 0u);
                     commit_index++;

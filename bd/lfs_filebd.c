@@ -12,6 +12,7 @@
 #include <errno.h>
 
 #ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #endif
 
@@ -204,7 +205,7 @@ int lfs_filebd_sync(const struct lfs_config *cfg) {
     // file sync
     lfs_filebd_t *bd = cfg->context;
     #ifdef _WIN32
-    int err = FlushFileBuffers((HANDLE) _get_osfhandle(fd)) ? 0 : -1;
+    int err = FlushFileBuffers((HANDLE)_get_osfhandle(bd->fd)) ? 0 : -1;
     #else
     int err = fsync(bd->fd);
     #endif
