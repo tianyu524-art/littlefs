@@ -1,110 +1,226 @@
 # littlefs Simulator
 
-一个功能完整的 littlefs 文件系统模拟器，用于在 Windows 环境下调试 littlefs 文件系统。
+`littlefs_simulator` is a Windows/Linux command-line simulator that runs the
+real `littlefs` sources on top of a file-backed block device.
 
-## 功能特性
+It is intended for:
 
-### 基础功能
-- ✅ **镜像文件支持** - 挂载和操作 littlefs 镜像文件
-- ✅ **文件操作** - 创建、读取、写入、删除文件
-- ✅ **目录操作** - 创建目录、列出内容
-- ✅ **重命名功能** - 文件和目录重命名
+- creating and opening littlefs image files on a PC
+- debugging filesystem behavior without target hardware
+- inspecting blocks and metadata pairs
+- running repeatable shell/script workflows against a flash image
 
-### 增强功能
-- ✅ **cd 命令** - 目录导航 (`cd <path>`, `cd ..`)
-- ✅ **pwd 命令** - 显示当前工作目录
-- ✅ **跨目录重命名** - 支持文件在不同目录间移动
-- ✅ **交互模式** - 命令行交互界面
+## Current scope
 
-## 项目结构
+This README describes the simulator as it exists in this repository today.
+It does not describe planned features that are not yet implemented.
 
-```
-simulator/
-├── littlefs_simulator.c     # C语言模拟器源码 (完整功能版)
-└── README.md               # 本说明文档
-```
+Implemented:
 
-## 使用方法
+- image creation with sidecar config
+- opening existing images with automatic geometry inference
+- file and directory operations in an interactive shell
+- script execution with `run`
+- block inspection commands
+- metadata pair dump and export
+- recursive tree printing with optional depth limit
+- file-backed flash erase behavior using `0xFF`
 
-### C语言版本 (推荐)
+Not implemented in the current simulator:
 
-**基本操作：**
+- fault injection commands
+- wear statistics
+- usage statistics
+- JSON output for `tree`
+
+## Files
+
+- `simulator/littlefs_simulator.c`
+- `simulator/littlefs_simulator.exe`
+
+## Default flash geometry
+
+Unless overridden:
+
+- `block_size = 131072` bytes
+- `block_count = 256`
+- `read_size = 256`
+- `prog_size = 256`
+- `cache_size = 1024`
+- `lookahead_size = 32`
+
+When opening an existing image, the simulator can automatically:
+
+- infer `block_count` from `image_size / block_size`
+- grow `lookahead_size` so it is large enough for the inferred block count
+
+## Build
+
+Example with GCC:
+
 ```bash
-# 格式化镜像
-littlefs_simulator.exe -f -i myimage.img
-
-# 创建文件
-littlefs_simulator.exe -i myimage.img -c hello.txt
-
-# 写入文件
-littlefs_simulator.exe -i myimage.img -w "hello.txt=Hello World!"
-
-# 读取文件
-littlefs_simulator.exe -i myimage.img -r hello.txt
-
-# 重命名文件/目录
-littlefs_simulator.exe -i myimage.img -n "oldname.txt=newname.txt"
-
-# 交互模式
-littlefs_simulator.exe -i myimage.img
+gcc -I. -I./bd -std=c99 -Wall -Wextra -pedantic \
+    -o simulator/littlefs_simulator.exe \
+    lfs.c lfs_util.c bd/lfs_filebd.c simulator/littlefs_simulator.c
 ```
 
-**交互模式命令：**
-```
-ls                    # 列出目录内容
-create <path>         # 创建文件
-mkdir <path>          # 创建目录
-read <path>           # 读取文件
-write <path=data>     # 写入文件
-rename <old=new>      # 重命名文件/目录
-cd <path>             # 切录导航
-pwd                   # 显示当前路径
-rm <path>             # 删除文件/目录
-quit/exit             # 退出
-```
+## Top-level commands
 
-## 编译指南 (C语言版本)
+### `create`
 
-### 环境要求
-- GCC 编译器 (推荐 TDM-GCC 或 MinGW-w64)
-- CMake (可选)
+Create a blank flash image filled with `0xFF` and write a sidecar config file.
 
-### 编译步骤
 ```bash
-# 直接编译
-gcc -I. -I./bd -std=c99 -Wall -Wextra -Os -o littlefs_simulator.exe lfs.c lfs_util.c bd/lfs_filebd.c simulator/littlefs_simulator.c
-
-# 或使用构建脚本
-build_c_version.bat
+simulator/littlefs_simulator.exe create --image test.bin
+simulator/littlefs_simulator.exe create --image test.bin --block-size 131072 --block-count 832
 ```
 
-## 已验证功能
+This creates:
 
-### 核心功能
-- [x] 镜像创建和格式化
-- [x] 文件创建、读取、写入、删除
-- [x] 目录创建和管理
-- [x] 重命名（文件和目录）
+- `test.bin`
+- `test.bin.cfg`
 
-### 扩展功能  
-- [x] cd 命令 - 目录导航
-- [x] pwd 命令 - 路径显示
-- [x] 跨目录重命名
-- [x] 绝对路径支持
-- [x] 交互式命令行界面
+### `open`
 
-## 应用场景
+Open an image and enter the interactive shell.
 
-- 调试 littlefs 应用程序
-- 预先创建文件系统镜像
-- 测试文件系统操作
-- 验证嵌入式代码的文件操作逻辑
-- littlefs 功能演示和学习
+```bash
+simulator/littlefs_simulator.exe open test.bin
+simulator/littlefs_simulator.exe open text.img --block-size 131072
+```
 
-## 技术说明
+Behavior:
 
-- 基于真实的 littlefs 库开发
-- 使用 filebd 后端模拟闪存行为
-- 与嵌入式系统完全兼容
-- 支持 littlefs 的所有基本功能
+- loads `*.cfg` if present
+- applies command-line overrides
+- auto-adjusts geometry when possible for existing images
+- attempts to mount immediately
+- if mount fails, keeps the device open and enters the shell unmounted
 
+Important:
+
+- a newly created blank image is not formatted as littlefs yet
+- for a fresh image, run `format` inside the shell first
+
+### `run`
+
+Execute a script file containing shell commands.
+
+```bash
+simulator/littlefs_simulator.exe run test.lfs --image test.bin
+simulator/littlefs_simulator.exe run test.lfs --image test.bin --stop-on-error
+```
+
+## Shell commands
+
+### Filesystem operations
+
+- `ls [path]`
+- `cd <path>`
+- `pwd`
+- `cat <file>`
+- `hexdump <file>`
+- `create <file>`
+- `write <file> <data>`
+- `mkdir <dir>`
+- `rm <path> [--recursive]`
+- `cp <src> <dst>`
+- `rename <src> <dst>`
+- `stat <path>`
+- `format`
+- `mount`
+- `umount`
+- `help`
+- `quit`
+
+### Diagnostics
+
+- `tree [path] [--depth N]`
+- `inspect blocks`
+- `inspect block <N>`
+- `meta-dump <path> [--block-only] [--parsed-only] [--export [file.txt]]`
+
+## Examples
+
+### First-time workflow
+
+```text
+open test.bin
+format
+mkdir /config
+write /config/device.txt ABC123
+tree /
+```
+
+### Tree view
+
+```text
+tree /
+tree / --depth 1
+tree /config --depth 0
+```
+
+### Block inspection
+
+```text
+inspect blocks
+inspect block 0
+inspect block 0xe1
+```
+
+`inspect blocks` prints a simple block usage map:
+
+- `#` means used
+- `.` means free
+
+### Metadata dump
+
+```text
+meta-dump /config
+meta-dump /config --block-only
+meta-dump /config --parsed-only
+meta-dump /config --export
+meta-dump /config --export config_dump.txt
+meta-dump /config/device.txt --export file_meta.txt
+```
+
+Current `meta-dump` behavior:
+
+- identifies the metadata pair for a directory or file path
+- prints active and mirror block information
+- prints each tag's raw bytes followed immediately by a parsed summary
+- trims large erased tails instead of dumping the entire block
+- for fully erased blocks, prints only two `0xFF` lines plus an omission note
+
+### Export behavior
+
+If `--export` is used:
+
+- an export file is written on the host filesystem
+- relative export paths are resolved under the simulator executable directory
+- if no file name is provided, a default name such as `meta_dump__config.txt`
+  is generated
+
+## Geometry validation
+
+When opening an existing image, the simulator validates:
+
+- the file exists
+- image size is divisible by `block_size`
+- final `block_count` matches the image size
+- `lookahead_size * 8 >= block_count`
+
+Example of automatic adjustment:
+
+```text
+Auto-adjusted block_count: 256 -> 832 based on image size 109051904
+Auto-adjusted lookahead_size: 32 -> 104 for block_count 832
+```
+
+## Notes
+
+- `meta-dump` is intended as a debugging aid, not a complete offline littlefs
+  forensic parser
+- the simulator uses a file-backed block device, so changes are persisted to the
+  image file immediately
+- erase operations write `0xFF` to match flash-style erased state
