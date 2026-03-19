@@ -994,13 +994,13 @@ static int build_child_path(
 static const char *lschk_status_name_legacy(lschk_status_t status) {
     switch (status) {
     case LSCHK_STATUS_REAL:
-        return "真文件";
+        return "realfile";
     case LSCHK_STATUS_GHOST:
-        return "幽灵文件";
+        return "ghostfile";
     case LSCHK_STATUS_DAMAGED:
-        return "损坏文件";
+        return "damagedfile";
     default:
-        return "未知";
+        return "unknown";
     }
 }
 
@@ -1373,11 +1373,11 @@ static int cmd_lsrepair_legacy(sim_state_t *sim, int argc, char **argv) {
             for (size_t i = 0; i < count; i++) {
                 if (entries[i].status == LSCHK_STATUS_GHOST &&
                         entries[i].type != LFS_TYPE_REG) {
-                    printf("skip  %s [幽灵文件] id=%u : 目录项不自动修复\n",
+                    printf("skip  %s [ghostfile] id=%u : directory ghost entries are not auto-repaired\n",
                             entries[i].name, entries[i].id);
                     skipped++;
                 } else if (entries[i].status == LSCHK_STATUS_DAMAGED) {
-                    printf("skip  %s [损坏文件] id=%u : 需要人工处理\n",
+                    printf("skip  %s [damagedfile] id=%u : manual repair required\n",
                             entries[i].name, entries[i].id);
                     skipped++;
                 }
@@ -1391,12 +1391,12 @@ static int cmd_lsrepair_legacy(sim_state_t *sim, int argc, char **argv) {
 
         int remove_err = lfs_debug_removeghost(&sim->lfs, path, victim.name, victim.id);
         if (remove_err) {
-            printf("fail  %s [幽灵文件] id=%u : %d\n",
+            printf("fail  %s [ghostfile] id=%u : %d\n",
                     victim.name, victim.id, remove_err);
             return remove_err;
         }
 
-        printf("fix   %s [幽灵文件] id=%u removed\n",
+        printf("fix   %s [ghostfile] id=%u removed\n",
                 victim.name, victim.id);
         removed++;
     }
