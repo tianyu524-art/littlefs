@@ -17,6 +17,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #define strcasecmp _stricmp
 #else
 #include <unistd.h>
@@ -95,8 +96,12 @@ typedef struct block_usage_map {
     lfs_size_t count;
 } block_usage_map_t;
 
+static char g_exe_dir[SIM_PATH_MAX];
+
 static void print_help(void);
 static int parse_cli(int argc, char **argv, cli_options_t *options);
+static void detect_executable_dir(
+        const char *argv0, char *buffer, size_t buffer_size);
 static void storage_cfg_set_defaults(sim_storage_cfg_t *storage);
 static void storage_cfg_apply_overrides(
         sim_storage_cfg_t *storage, const cli_options_t *options);
@@ -162,7 +167,9 @@ static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer,
 static void print_hexdump(const uint8_t *data, size_t size);
 static void print_hexdump_with_base(
         const uint8_t *data, size_t size, uint32_t base_offset);
-static void print_erased_block_preview(size_t block_size);
+static void fprint_hexdump_with_base(
+        FILE *out, const uint8_t *data, size_t size, uint32_t base_offset);
+static void fprint_erased_block_preview(FILE *out, size_t block_size);
 static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size);
 static int read_device_bytes(
         sim_state_t *sim, uint64_t offset, void *buffer, size_t size);
@@ -170,14 +177,21 @@ static int read_device_block(
         sim_state_t *sim, lfs_block_t block, uint8_t *buffer);
 static int inspect_mark_used_block(void *data, lfs_block_t block);
 static const char *meta_tag_type_name(uint16_t type);
-static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t size);
+static void fmeta_print_tag_data(
+        FILE *out, uint16_t type, const uint8_t *data, lfs_size_t size);
 static bool buffer_is_erased(const uint8_t *buffer, size_t size);
+static void build_default_meta_dump_name(
+        const char *path, char *buffer, size_t buffer_size);
+static void resolve_export_path(
+        const char *requested, const char *target_path,
+        char *buffer, size_t buffer_size);
 static int meta_dump_target(sim_state_t *sim, const char *path,
-        bool block_only, bool parsed_only);
+        bool block_only, bool parsed_only, FILE *out);
 
 int main(int argc, char **argv) {
     cli_options_t options;
     memset(&options, 0, sizeof(options));
+    detect_executable_dir(argv[0], g_exe_dir, sizeof(g_exe_dir));
 
     int err = parse_cli(argc, argv, &options);
     if (err) {
@@ -307,7 +321,7 @@ static void print_help(void) {
     printf("  rename <src> <dst>\n");
     printf("  stat <path>\n");
     printf("  tree [path] [--depth N]\n");
-    printf("  meta-dump <path> [--block-only] [--parsed-only]\n");
+    printf("  meta-dump <path> [--block-only] [--parsed-only] [--export [file.txt]]\n");
     printf("  inspect blocks\n");
     printf("  inspect block <N>\n");
     printf("  format\n");
@@ -398,6 +412,57 @@ static int parse_cli(int argc, char **argv, cli_options_t *options) {
     }
 
     return 0;
+}
+
+static void detect_executable_dir(
+        const char *argv0, char *buffer, size_t buffer_size) {
+    if (buffer_size == 0) {
+        return;
+    }
+
+#ifdef _WIN32
+    DWORD len = GetModuleFileNameA(NULL, buffer, (DWORD)buffer_size);
+    if (len > 0 && len < buffer_size) {
+        char *slash = strrchr(buffer, '\\');
+        if (!slash) {
+            slash = strrchr(buffer, '/');
+        }
+        if (slash) {
+            *slash = '\0';
+            return;
+        }
+    }
+#else
+    ssize_t len = readlink("/proc/self/exe", buffer, buffer_size - 1);
+    if (len > 0 && (size_t)len < buffer_size) {
+        buffer[len] = '\0';
+        char *slash = strrchr(buffer, '/');
+        if (slash) {
+            *slash = '\0';
+            return;
+        }
+    }
+#endif
+
+    if (argv0 && argv0[0] != '\0') {
+        strncpy(buffer, argv0, buffer_size - 1);
+        buffer[buffer_size - 1] = '\0';
+        char *slash = strrchr(buffer, '\\');
+        if (!slash) {
+            slash = strrchr(buffer, '/');
+        }
+        if (slash) {
+            *slash = '\0';
+            return;
+        }
+    }
+
+#ifdef _WIN32
+    _getcwd(buffer, (int)buffer_size);
+#else
+    getcwd(buffer, buffer_size);
+#endif
+    buffer[buffer_size - 1] = '\0';
 }
 
 static void storage_cfg_set_defaults(sim_storage_cfg_t *storage) {
@@ -1150,21 +1215,26 @@ static int cmd_cat(sim_state_t *sim, int argc, char **argv) {
 
 static void print_hexdump_with_base(
         const uint8_t *data, size_t size, uint32_t base_offset) {
+    fprint_hexdump_with_base(stdout, data, size, base_offset);
+}
+
+static void fprint_hexdump_with_base(
+        FILE *out, const uint8_t *data, size_t size, uint32_t base_offset) {
     for (size_t i = 0; i < size; i += 16) {
-        printf("%08"PRIx32"  ", base_offset + (uint32_t)i);
+        fprintf(out, "%08"PRIx32"  ", base_offset + (uint32_t)i);
         for (size_t j = 0; j < 16; j++) {
             if (i+j < size) {
-                printf("%02x ", data[i+j]);
+                fprintf(out, "%02x ", data[i+j]);
             } else {
-                printf("   ");
+                fprintf(out, "   ");
             }
         }
-        printf(" ");
+        fprintf(out, " ");
         for (size_t j = 0; j < 16 && i+j < size; j++) {
             uint8_t c = data[i+j];
-            putchar(isprint(c) ? c : '.');
+            fputc(isprint(c) ? c : '.', out);
         }
-        putchar('\n');
+        fputc('\n', out);
     }
 }
 
@@ -1172,12 +1242,12 @@ static void print_hexdump(const uint8_t *data, size_t size) {
     print_hexdump_with_base(data, size, 0);
 }
 
-static void print_erased_block_preview(size_t block_size) {
+static void fprint_erased_block_preview(FILE *out, size_t block_size) {
     uint8_t line[32];
     memset(line, 0xff, sizeof(line));
-    print_hexdump_with_base(line, sizeof(line), 0);
+    fprint_hexdump_with_base(out, line, sizeof(line), 0);
     if (block_size > sizeof(line)) {
-        printf("... erased block omitted (%zu bytes total)\n", block_size);
+        fprintf(out, "... erased block omitted (%zu bytes total)\n", block_size);
     }
 }
 
@@ -1211,6 +1281,63 @@ static bool buffer_is_erased(const uint8_t *buffer, size_t size) {
         }
     }
     return true;
+}
+
+static void build_default_meta_dump_name(
+        const char *path, char *buffer, size_t buffer_size) {
+    const char *source = (strcmp(path, "/") == 0) ? "root" : path;
+    size_t off = 0;
+    const char *prefix = "meta_dump_";
+    while (*prefix != '\0' && off + 1 < buffer_size) {
+        buffer[off++] = *prefix++;
+    }
+
+    for (const char *p = source; *p != '\0' && off + 5 < buffer_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c) || c == '-' || c == '_') {
+            buffer[off++] = (char)c;
+        } else {
+            buffer[off++] = '_';
+        }
+    }
+
+    const char *suffix = ".txt";
+    while (*suffix != '\0' && off + 1 < buffer_size) {
+        buffer[off++] = *suffix++;
+    }
+    buffer[off] = '\0';
+}
+
+static void resolve_export_path(
+        const char *requested, const char *target_path,
+        char *buffer, size_t buffer_size) {
+    char filename[SIM_PATH_MAX];
+    if (requested && requested[0] != '\0') {
+        strncpy(filename, requested, sizeof(filename) - 1);
+        filename[sizeof(filename) - 1] = '\0';
+    } else {
+        build_default_meta_dump_name(target_path, filename, sizeof(filename));
+    }
+
+    bool absolute = false;
+#ifdef _WIN32
+    absolute = (strlen(filename) >= 2 && filename[1] == ':') ||
+            filename[0] == '\\' || filename[0] == '/';
+#else
+    absolute = filename[0] == '/';
+#endif
+
+    if (absolute) {
+        strncpy(buffer, filename, buffer_size - 1);
+        buffer[buffer_size - 1] = '\0';
+        return;
+    }
+
+#ifdef _WIN32
+    snprintf(buffer, buffer_size, "%s\\%s", g_exe_dir, filename);
+#else
+    snprintf(buffer, buffer_size, "%s/%s", g_exe_dir, filename);
+#endif
 }
 
 static const char *meta_tag_type_name(uint16_t type) {
@@ -1268,20 +1395,21 @@ static const char *meta_tag_type_name(uint16_t type) {
     return "unknown";
 }
 
-static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t size) {
+static void fmeta_print_tag_data(
+        FILE *out, uint16_t type, const uint8_t *data, lfs_size_t size) {
     bool show_ascii = (type == LFS_TYPE_REG || type == LFS_TYPE_DIR ||
             type == LFS_TYPE_SUPERBLOCK || (type & 0x700) == LFS_TYPE_NAME);
     if (show_ascii && size > 0) {
-        printf(" data=\"");
+        fprintf(out, " data=\"");
         for (lfs_size_t i = 0; i < size; i++) {
             uint8_t c = data[i];
             if (isprint(c) && c != '"' && c != '\\') {
-                putchar(c);
+                fputc(c, out);
             } else {
-                printf("\\x%02x", c);
+                fprintf(out, "\\x%02x", c);
             }
         }
-        printf("\"");
+        fprintf(out, "\"");
         return;
     }
 
@@ -1292,7 +1420,7 @@ static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t s
         uint32_t pair1;
         memcpy(&pair0, data, sizeof(pair0));
         memcpy(&pair1, data + 4, sizeof(pair1));
-        printf(" pair={0x%"PRIx32",0x%"PRIx32"}",
+        fprintf(out, " pair={0x%"PRIx32",0x%"PRIx32"}",
                 lfs_fromle32(pair0), lfs_fromle32(pair1));
         return;
     }
@@ -1302,7 +1430,7 @@ static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t s
         uint32_t bytes;
         memcpy(&head, data, sizeof(head));
         memcpy(&bytes, data + 4, sizeof(bytes));
-        printf(" ctz={head=0x%"PRIx32", size=%"PRIu32"}",
+        fprintf(out, " ctz={head=0x%"PRIx32", size=%"PRIu32"}",
                 lfs_fromle32(head), lfs_fromle32(bytes));
         return;
     }
@@ -1310,7 +1438,7 @@ static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t s
     if ((type == LFS_TYPE_CCRC || type == LFS_TYPE_FCRC) && size >= 4) {
         uint32_t crc;
         memcpy(&crc, data, sizeof(crc));
-        printf(" value=0x%08"PRIx32, lfs_fromle32(crc));
+        fprintf(out, " value=0x%08"PRIx32, lfs_fromle32(crc));
         return;
     }
 
@@ -1318,13 +1446,13 @@ static void meta_print_tag_data(uint16_t type, const uint8_t *data, lfs_size_t s
         return;
     }
 
-    printf(" data=");
+    fprintf(out, " data=");
     lfs_size_t limit = lfs_min(size, (lfs_size_t)16);
     for (lfs_size_t i = 0; i < limit; i++) {
-        printf("%02x", data[i]);
+        fprintf(out, "%02x", data[i]);
     }
     if (size > limit) {
-        printf("...");
+        fprintf(out, "...");
     }
 }
 
@@ -1836,7 +1964,7 @@ static int cmd_inspect(sim_state_t *sim, int argc, char **argv) {
 }
 
 static int meta_dump_target(sim_state_t *sim, const char *path,
-        bool block_only, bool parsed_only) {
+        bool block_only, bool parsed_only, FILE *out) {
     lfs_mdir_t mdir;
     memset(&mdir, 0, sizeof(mdir));
 
@@ -1900,39 +2028,43 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
         active_index = 1;
     }
 
-    printf("Metadata dump for %s\n", path);
-    printf("  pair     : {0x%"PRIx32", 0x%"PRIx32"}\n", mdir.pair[0], mdir.pair[1]);
-    printf("  active   : 0x%"PRIx32" (rev=%"PRIu32")\n",
+    fprintf(out, "Metadata dump for %s\n", path);
+    fprintf(out, "  pair     : {0x%"PRIx32", 0x%"PRIx32"}\n",
+            mdir.pair[0], mdir.pair[1]);
+    fprintf(out, "  active   : 0x%"PRIx32" (rev=%"PRIu32")\n",
             mdir.pair[active_index], active_index == 0 ? rev0 : rev1);
-    printf("  mirror   : 0x%"PRIx32" (rev=%"PRIu32")\n",
+    fprintf(out, "  mirror   : 0x%"PRIx32" (rev=%"PRIu32")\n",
             mdir.pair[1 - active_index], active_index == 0 ? rev1 : rev0);
-    printf("  dir.rev  : %"PRIu32"\n", mdir.rev);
+    fprintf(out, "  dir.rev  : %"PRIu32"\n", mdir.rev);
     if (has_entry) {
-        printf("  entry    : id=%u type=%s\n", entry_id,
+        fprintf(out, "  entry    : id=%u type=%s\n", entry_id,
                 entry_type == LFS_TYPE_DIR ? "DIR" : "FILE");
     }
-    putchar('\n');
+    fputc('\n', out);
 
     const uint8_t *blocks[2] = {block0, block1};
     const uint32_t revs[2] = {rev0, rev1};
     for (int bi = 0; bi < 2; bi++) {
         const uint8_t *block = blocks[bi];
-        printf("Block 0x%"PRIx32" [%s] revision=%"PRIu32"\n",
+        fprintf(out, "Block 0x%"PRIx32" [%s] revision=%"PRIu32"\n",
                 mdir.pair[bi], (bi == active_index) ? "ACTIVE" : "MIRROR", revs[bi]);
 
-        if (!parsed_only) {
+        size_t dump_size = 0;
+        if (!buffer_is_erased(block, sim->storage.block_size)) {
+            dump_size = effective_block_dump_size(block, sim->storage.block_size);
+        }
+
+        if (block_only) {
             if (buffer_is_erased(block, sim->storage.block_size)) {
-                print_erased_block_preview(sim->storage.block_size);
+                fprint_erased_block_preview(out, sim->storage.block_size);
             } else {
-                size_t dump_size = effective_block_dump_size(
-                        block, sim->storage.block_size);
-                print_hexdump(block, dump_size);
+                fprint_hexdump_with_base(out, block, dump_size, 0);
                 if (dump_size < sim->storage.block_size) {
-                    printf("... trailing erased area omitted (%zu bytes shown of %"PRIu32")\n",
+                    fprintf(out, "... trailing erased area omitted (%zu bytes shown of %"PRIu32")\n",
                             dump_size, (uint32_t)sim->storage.block_size);
                 }
             }
-            putchar('\n');
+            fputc('\n', out);
         }
 
         if (!block_only) {
@@ -1958,7 +2090,7 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
                 lfs_size_t dsize = 4 + ((size != 0x3ffu) ? size : 0);
 
                 if (off + dsize > sim->storage.block_size) {
-                    printf("  [TRUNCATED] off=0x%04"PRIx32" decoded=0x%08"PRIx32"\n",
+                    fprintf(out, "  [TRUNCATED] off=0x%04"PRIx32" decoded=0x%08"PRIx32"\n",
                             (uint32_t)off, decoded_tag);
                     break;
                 }
@@ -1969,16 +2101,19 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
                         : lfs_crc(crc, block + off, dsize);
 
                 if (tag_index == 0) {
-                    printf("  commit #%d (offset 0x%04"PRIx32")\n",
+                    fprintf(out, "  commit #%d (offset 0x%04"PRIx32")\n",
                             commit_index, (uint32_t)off);
                 }
 
-                printf("    [tag %d] off=0x%04"PRIx32" raw=0x%08"PRIx32
+                if (!parsed_only) {
+                    fprint_hexdump_with_base(out, block + off, dsize, (uint32_t)off);
+                }
+                fprintf(out, "      -> [tag %d] raw=0x%08"PRIx32
                         " decoded=0x%08"PRIx32" type=%s id=%u size=%u",
-                        tag_index, (uint32_t)off, raw_tag, decoded_tag,
+                        tag_index, raw_tag, decoded_tag,
                         meta_tag_type_name(type), id, size);
-                meta_print_tag_data(type, data, size == 0x3ffu ? 0 : size);
-                putchar('\n');
+                fmeta_print_tag_data(out, type, data, size == 0x3ffu ? 0 : size);
+                fputc('\n', out);
 
                 off += dsize;
                 tag_index++;
@@ -1993,7 +2128,11 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
                     prev_tag = decoded_tag;
                 }
             }
-            putchar('\n');
+            if (!parsed_only && dump_size > 0 && dump_size < sim->storage.block_size) {
+                fprintf(out, "  ... trailing erased area omitted (%zu bytes shown of %"PRIu32")\n",
+                        dump_size, (uint32_t)sim->storage.block_size);
+            }
+            fputc('\n', out);
         }
     }
 
@@ -2004,11 +2143,13 @@ static int meta_dump_target(sim_state_t *sim, const char *path,
 
 static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
-        fprintf(stderr, "usage: meta-dump <path> [--block-only] [--parsed-only]\n");
+        fprintf(stderr,
+                "usage: meta-dump <path> [--block-only] [--parsed-only] [--export [file.txt]]\n");
         return -1;
     }
 
     const char *target = NULL;
+    const char *export_name = NULL;
     bool block_only = false;
     bool parsed_only = false;
     for (int i = 1; i < argc; i++) {
@@ -2016,6 +2157,12 @@ static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
             block_only = true;
         } else if (strcmp(argv[i], "--parsed-only") == 0) {
             parsed_only = true;
+        } else if (strcmp(argv[i], "--export") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                export_name = argv[++i];
+            } else {
+                export_name = "";
+            }
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "meta-dump: unknown option %s\n", argv[i]);
             return -1;
@@ -2042,7 +2189,32 @@ static int cmd_meta_dump(sim_state_t *sim, int argc, char **argv) {
         return -1;
     }
 
-    return meta_dump_target(sim, path, block_only, parsed_only);
+    int err = meta_dump_target(sim, path, block_only, parsed_only, stdout);
+    if (err) {
+        return err;
+    }
+
+    if (export_name != NULL) {
+        char export_path[SIM_PATH_MAX];
+        resolve_export_path(export_name, path, export_path, sizeof(export_path));
+
+        FILE *f = fopen(export_path, "w");
+        if (!f) {
+            fprintf(stderr, "meta-dump: failed to open export file %s: %s\n",
+                    export_path, strerror(errno));
+            return -1;
+        }
+
+        err = meta_dump_target(sim, path, block_only, parsed_only, f);
+        fclose(f);
+        if (err) {
+            return err;
+        }
+
+        printf("meta-dump exported to %s\n", export_path);
+    }
+
+    return 0;
 }
 
 static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *should_exit) {
