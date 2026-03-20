@@ -5390,6 +5390,76 @@ int lfs_remove(lfs_t *lfs, const char *path) {
 #endif
 
 #ifndef LFS_READONLY
+int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
+        const char *name, uint16_t id) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_debug_removeghost(%p, \"%s\", \"%s\", %"PRIu16")",
+            (void*)lfs, dirpath, name, id);
+
+    err = lfs_fs_forceconsistency(lfs);
+    if (err) {
+        goto cleanup;
+    }
+
+    lfs_dir_t dir;
+    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    if (err) {
+        goto cleanup;
+    }
+
+    struct lfs_info info;
+    err = lfs_dir_getinfo(lfs, &dir.m, id, &info);
+    if (err) {
+        goto close_dir;
+    }
+
+    if (strcmp(info.name, name) != 0) {
+        err = LFS_ERR_NOENT;
+        goto close_dir;
+    }
+
+    if (info.type == LFS_TYPE_DIR) {
+        err = LFS_ERR_ISDIR;
+        goto close_dir;
+    }
+
+    char path[LFS_NAME_MAX + 256];
+    int len = snprintf(path, sizeof(path),
+            strcmp(dirpath, "/") == 0 ? "/%s" : "%s/%s", dirpath, name);
+    if (len < 0 || (size_t)len >= sizeof(path)) {
+        err = LFS_ERR_NAMETOOLONG;
+        goto close_dir;
+    }
+
+    lfs_mdir_t cwd;
+    const char *lookup = path;
+    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &lookup, NULL);
+    if (tag < 0) {
+        err = (int)tag;
+        goto close_dir;
+    }
+
+    if (lfs_pair_cmp(cwd.pair, dir.m.pair) == 0 && lfs_tag_id(tag) == id) {
+        err = LFS_ERR_EXIST;
+        goto close_dir;
+    }
+
+    err = lfs_dir_commit(lfs, &dir.m, LFS_MKATTRS(
+            {LFS_MKTAG(LFS_TYPE_DELETE, id, 0), NULL}));
+
+close_dir:
+    lfs_dir_rawclose(lfs, &dir);
+cleanup:
+    LFS_TRACE("lfs_debug_removeghost -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
 int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
@@ -5816,4 +5886,3 @@ int lfs_migrate(lfs_t *lfs, const struct lfs_config *cfg) {
     return err;
 }
 #endif
-

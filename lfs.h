@@ -467,6 +467,13 @@ int lfs_remove(lfs_t *lfs, const char *path);
 //
 // Returns a negative error code on failure.
 int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
+
+// Removes a specific ghost entry by directory path, entry name, and id.
+//
+// This is intended for repair workflows. The function is conservative and
+// fails if the requested id currently resolves as the normal path target.
+int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
+        const char *name, uint16_t id);
 #endif
 
 // Find info about a file or directory
