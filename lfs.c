@@ -7,6 +7,7 @@
  */
 #include "lfs.h"
 #include "lfs_util.h"
+#include <time.h>
 
 
 // some constants used throughout the code
@@ -419,6 +420,15 @@ static void lfs_ctz_fromle32(struct lfs_ctz *ctz) {
     ctz->size = lfs_fromle32(ctz->size);
 }
 
+static uint64_t lfs_fromle64(uint64_t a) {
+    return ((uint64_t)lfs_fromle32((uint32_t)(a >>  0)) <<  0) |
+           ((uint64_t)lfs_fromle32((uint32_t)(a >> 32)) << 32);
+}
+
+static uint64_t lfs_tole64(uint64_t a) {
+    return lfs_fromle64(a);
+}
+
 #ifndef LFS_READONLY
 static void lfs_ctz_tole32(struct lfs_ctz *ctz) {
     ctz->head = lfs_tole32(ctz->head);
@@ -473,6 +483,40 @@ static void lfs_mlist_append(lfs_t *lfs, struct lfs_mlist *mlist) {
     lfs->mlist = mlist;
 }
 
+static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
+        lfs_tag_t gmask, lfs_tag_t gtag, void *buffer);
+
+static void lfs_entry_timestamps(lfs_t *lfs, const lfs_mdir_t *dir,
+        uint16_t id, uint64_t *ctime, uint64_t *mtime) {
+    uint64_t raw = 0;
+
+    if (ctime) {
+        *ctime = 0;
+        lfs_stag_t tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_CTIME, id, sizeof(raw)), &raw);
+        if (tag >= 0) {
+            *ctime = lfs_fromle64(raw);
+        }
+    }
+
+    raw = 0;
+    if (mtime) {
+        *mtime = 0;
+        lfs_stag_t tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_MTIME, id, sizeof(raw)), &raw);
+        if (tag >= 0) {
+            *mtime = lfs_fromle64(raw);
+        }
+    }
+}
+
+#ifndef LFS_READONLY
+static uint64_t lfs_now(void) {
+    time_t now = time(NULL);
+    return (now > 0) ? (uint64_t)now : 0;
+}
+#endif
+
 
 /// Internal operations predeclared here ///
 #ifndef LFS_READONLY
@@ -498,6 +542,15 @@ static int lfs_fs_pred(lfs_t *lfs, const lfs_block_t dir[2],
 static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t dir[2],
         lfs_mdir_t *parent);
 static int lfs_fs_forceconsistency(lfs_t *lfs);
+static int lfs_commitattr(lfs_t *lfs, const char *path,
+        uint8_t type, const void *buffer, lfs_size_t size);
+static int lfs_commitattrs(lfs_t *lfs, const char *path,
+        bool setctime, uint64_t ctime,
+        bool setmtime, uint64_t mtime);
+static int lfs_parentpath(const char *path, char *buffer, lfs_size_t size);
+static void lfs_entry_timestamps(lfs_t *lfs, const lfs_mdir_t *dir,
+        uint16_t id, uint64_t *ctime, uint64_t *mtime);
+static uint64_t lfs_now(void);
 #endif
 
 #ifdef LFS_MIGRATE
@@ -506,6 +559,8 @@ static int lfs1_traverse(lfs_t *lfs,
 #endif
 
 static int lfs_dir_rawrewind(lfs_t *lfs, lfs_dir_t *dir);
+static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
+        lfs_tag_t gmask, lfs_tag_t gtag, void *buffer);
 
 static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
         void *buffer, lfs_size_t size);
@@ -1262,6 +1317,9 @@ static int lfs_dir_getinfo(lfs_t *lfs, lfs_mdir_t *dir,
         // special case for root
         strcpy(info->name, "/");
         info->type = LFS_TYPE_DIR;
+        info->size = 0;
+        info->ctime = 0;
+        info->mtime = 0;
         return 0;
     }
 
@@ -1285,7 +1343,11 @@ static int lfs_dir_getinfo(lfs_t *lfs, lfs_mdir_t *dir,
         info->size = ctz.size;
     } else if (lfs_tag_type3(tag) == LFS_TYPE_INLINESTRUCT) {
         info->size = lfs_tag_size(tag);
+    } else {
+        info->size = 0;
     }
+
+    lfs_entry_timestamps(lfs, dir, id, &info->ctime, &info->mtime);
 
     return 0;
 }
@@ -2393,6 +2455,8 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
 /// Top level directory operations ///
 #ifndef LFS_READONLY
 static int lfs_rawmkdir(lfs_t *lfs, const char *path) {
+    const char *fullpath = path;
+
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
     if (err) {
@@ -2480,6 +2544,12 @@ static int lfs_rawmkdir(lfs_t *lfs, const char *path) {
             {LFS_MKTAG_IF(!cwd.m.split,
                 LFS_TYPE_SOFTTAIL, 0x3ff, 8), dir.pair}));
     lfs_pair_fromle32(dir.pair);
+    if (err) {
+        return err;
+    }
+
+    uint64_t now = lfs_now();
+    err = lfs_commitattrs(lfs, fullpath, true, now, true, now);
     if (err) {
         return err;
     }
@@ -2835,6 +2905,7 @@ static int lfs_ctz_traverse(lfs_t *lfs,
 static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags,
         const struct lfs_file_config *cfg) {
+    const char *fullpath = path;
 #ifndef LFS_READONLY
     // deorphan if we haven't yet, needed at most once after poweron
     if ((flags & LFS_O_WRONLY) == LFS_O_WRONLY) {
@@ -2853,7 +2924,15 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
     file->flags = flags;
     file->pos = 0;
     file->off = 0;
+    file->block = LFS_BLOCK_NULL;
     file->cache.buffer = NULL;
+    strncpy(file->path, fullpath, sizeof(file->path) - 1);
+    file->path[sizeof(file->path) - 1] = '\0';
+    file->mtimeflag = false;
+    file->ctimeflag = false;
+    file->mtime = 0;
+    file->ctime = 0;
+    bool created = false;
 
     // allocate entry for file if it doesn't exist
     lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
@@ -2898,6 +2977,7 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         }
 
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, 0, 0);
+        created = true;
     } else if (flags & LFS_O_EXCL) {
         err = LFS_ERR_EXIST;
         goto cleanup;
@@ -2906,11 +2986,16 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         err = LFS_ERR_ISDIR;
         goto cleanup;
 #ifndef LFS_READONLY
-    } else if (flags & LFS_O_TRUNC) {
+    } else {
+        lfs_entry_timestamps(lfs, &file->m, file->id, &file->ctime, &file->mtime);
+    }
+
+    if (flags & LFS_O_TRUNC) {
         // truncate if requested
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0);
         file->flags |= LFS_F_DIRTY;
-#endif
+        file->mtime = lfs_now();
+        file->mtimeflag = true;
     } else {
         // try to load what's on disk, if it's inlined we'll fix it later
         tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x700, 0x3ff, 0),
@@ -2921,6 +3006,18 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         }
         lfs_ctz_fromle32(&file->ctz);
     }
+#else
+    } else {
+        // try to load what's on disk, if it's inlined we'll fix it later
+        tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x700, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_STRUCT, file->id, 8), &file->ctz);
+        if (tag < 0) {
+            err = tag;
+            goto cleanup;
+        }
+        lfs_ctz_fromle32(&file->ctz);
+    }
+#endif
 
     // fetch attrs
     for (unsigned i = 0; i < file->cfg->attr_count; i++) {
@@ -2986,6 +3083,17 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
             }
         }
     }
+
+#ifndef LFS_READONLY
+    if (created) {
+        uint64_t now = lfs_now();
+        file->ctime = now;
+        file->mtime = now;
+        file->ctimeflag = true;
+        file->mtimeflag = true;
+        file->flags |= LFS_F_DIRTY;
+    }
+#endif
 
     return 0;
 
@@ -3205,6 +3313,9 @@ static int lfs_file_rawsync(lfs_t *lfs, lfs_file_t *file) {
 
     if ((file->flags & LFS_F_DIRTY) &&
             !lfs_pair_isnull(file->m.pair)) {
+        bool ctime_dirty = file->ctimeflag;
+        bool mtime_dirty = file->mtimeflag;
+
         // update dir entry
         uint16_t type;
         const void *buffer;
@@ -3225,17 +3336,70 @@ static int lfs_file_rawsync(lfs_t *lfs, lfs_file_t *file) {
             size = sizeof(ctz);
         }
 
+        uint64_t ctime_le = lfs_tole64(file->ctime);
+        uint64_t mtime_le = lfs_tole64(file->mtime);
+        lfs_size_t total_attrs = file->cfg->attr_count + 2;
+        struct lfs_attr *attrs = NULL;
+        if (total_attrs > 0) {
+            attrs = lfs_malloc(total_attrs * sizeof(*attrs));
+            if (!attrs) {
+                file->flags |= LFS_F_ERRED;
+                return LFS_ERR_NOMEM;
+            }
+
+            lfs_size_t attr_index = 0;
+            for (lfs_size_t i = 0; i < file->cfg->attr_count; i++) {
+                if (file->cfg->attrs[i].type == LFS_ATTR_CTIME ||
+                        file->cfg->attrs[i].type == LFS_ATTR_MTIME) {
+                    continue;
+                }
+
+                attrs[attr_index++] = file->cfg->attrs[i];
+            }
+
+            attrs[attr_index].type = LFS_ATTR_CTIME;
+            attrs[attr_index].buffer = &ctime_le;
+            attrs[attr_index].size = sizeof(ctime_le);
+            attr_index += 1;
+
+            attrs[attr_index].type = LFS_ATTR_MTIME;
+            attrs[attr_index].buffer = &mtime_le;
+            attrs[attr_index].size = sizeof(mtime_le);
+            attr_index += 1;
+
+            total_attrs = attr_index;
+        }
+
         // commit file data and attributes
         err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
                 {LFS_MKTAG(type, file->id, size), buffer},
                 {LFS_MKTAG(LFS_FROM_USERATTRS, file->id,
-                    file->cfg->attr_count), file->cfg->attrs}));
+                    total_attrs), attrs}));
+        lfs_free(attrs);
         if (err) {
             file->flags |= LFS_F_ERRED;
             return err;
         }
 
         file->flags &= ~LFS_F_DIRTY;
+        file->ctimeflag = false;
+        file->mtimeflag = false;
+
+        if (mtime_dirty && file->path[0] != '\0') {
+            char parent[LFS_NAME_MAX+1];
+            int parent_err = lfs_parentpath(file->path, parent, sizeof(parent));
+            if (!parent_err) {
+                parent_err = lfs_commitattrs(lfs, parent,
+                        false, 0, true, file->mtime);
+            }
+
+            if (parent_err && parent_err != LFS_ERR_INVAL) {
+                file->flags |= LFS_F_ERRED;
+                return parent_err;
+            }
+        }
+
+        (void)ctime_dirty;
     }
 
     return 0;
@@ -3413,6 +3577,9 @@ relocate:
 static lfs_ssize_t lfs_file_rawwrite(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
+
+    file->mtime = lfs_now();
+    file->mtimeflag = true;
 
     if (file->flags & LFS_F_READING) {
         // drop any reads
@@ -3693,6 +3860,8 @@ static int lfs_rawremove(lfs_t *lfs, const char *path) {
 
 #ifndef LFS_READONLY
 static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
+    const char *newfullpath = newpath;
+
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
     if (err) {
@@ -3705,6 +3874,9 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
     if (oldtag < 0 || lfs_tag_id(oldtag) == 0x3ff) {
         return (oldtag < 0) ? (int)oldtag : LFS_ERR_INVAL;
     }
+
+    uint64_t oldmtime = 0;
+    lfs_entry_timestamps(lfs, &oldcwd, lfs_tag_id(oldtag), NULL, &oldmtime);
 
     // find new entry
     lfs_mdir_t newcwd;
@@ -3823,6 +3995,16 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
         }
     }
 
+    uint64_t now = lfs_now();
+    if (lfs_tag_type3(oldtag) == LFS_TYPE_DIR) {
+        err = lfs_commitattrs(lfs, newfullpath, true, now, true, now);
+    } else {
+        err = lfs_commitattrs(lfs, newfullpath, true, now, true, oldmtime);
+    }
+    if (err) {
+        return err;
+    }
+
     return 0;
 }
 #endif
@@ -3881,6 +4063,61 @@ static int lfs_commitattr(lfs_t *lfs, const char *path,
 
     return lfs_dir_commit(lfs, &cwd, LFS_MKATTRS(
             {LFS_MKTAG(LFS_TYPE_USERATTR + type, id, size), buffer}));
+}
+
+static int lfs_commitattrs(lfs_t *lfs, const char *path,
+        bool setctime, uint64_t ctime,
+        bool setmtime, uint64_t mtime) {
+    lfs_mdir_t cwd;
+    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, NULL);
+    if (tag < 0) {
+        return (int)tag;
+    }
+
+    uint16_t id = lfs_tag_id(tag);
+    uint64_t ctime_le = lfs_tole64(ctime);
+    uint64_t mtime_le = lfs_tole64(mtime);
+    struct lfs_mattr attrs[2];
+    int attrcount = 0;
+
+    if (setctime) {
+        attrs[attrcount].tag = LFS_MKTAG(LFS_TYPE_CTIME, id, sizeof(ctime_le));
+        attrs[attrcount].buffer = &ctime_le;
+        attrcount += 1;
+    }
+
+    if (setmtime) {
+        attrs[attrcount].tag = LFS_MKTAG(LFS_TYPE_MTIME, id, sizeof(mtime_le));
+        attrs[attrcount].buffer = &mtime_le;
+        attrcount += 1;
+    }
+
+    if (attrcount == 0) {
+        return 0;
+    }
+
+    return lfs_dir_commit(lfs, &cwd, attrs, attrcount);
+}
+
+static int lfs_parentpath(const char *path, char *buffer, lfs_size_t size) {
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) {
+        if (size < 2) {
+            return LFS_ERR_NAMETOOLONG;
+        }
+
+        strcpy(buffer, "/");
+        return 0;
+    }
+
+    lfs_size_t len = slash - path;
+    if (len + 1 > size) {
+        return LFS_ERR_NAMETOOLONG;
+    }
+
+    memcpy(buffer, path, len);
+    buffer[len] = '\0';
+    return 0;
 }
 #endif
 

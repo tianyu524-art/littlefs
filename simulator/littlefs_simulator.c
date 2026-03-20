@@ -203,6 +203,7 @@ static void fmeta_print_tag_data(
         FILE *out, uint16_t type, const uint8_t *data, lfs_size_t size);
 static bool buffer_is_erased(const uint8_t *buffer, size_t size);
 static bool meta_type_is_crc(uint16_t type);
+static uint64_t sim_fromle64(uint64_t value);
 static const char *lschk_status_name(lschk_status_t status);
 static bool pair_equals(const lfs_block_t a[2], const lfs_block_t b[2]);
 static int build_child_path(
@@ -1063,6 +1064,11 @@ static bool pair_equals(const lfs_block_t a[2], const lfs_block_t b[2]) {
     return a[0] == b[0] && a[1] == b[1];
 }
 
+static uint64_t sim_fromle64(uint64_t value) {
+    return ((uint64_t)lfs_fromle32((uint32_t)(value >> 0)) << 0) |
+           ((uint64_t)lfs_fromle32((uint32_t)(value >> 32)) << 32);
+}
+
 static int build_child_path(
         const char *dir_path, const char *name, char *buffer, size_t buffer_size) {
     if (strcmp(dir_path, "/") == 0) {
@@ -1110,16 +1116,18 @@ static int cmd_ls(sim_state_t *sim, int argc, char **argv) {
     }
 
     printf("Listing %s\n", path);
-    printf("%-6s %-10s %s\n", "TYPE", "SIZE", "NAME");
+    printf("%-6s %-10s %-12s %-12s %s\n", "TYPE", "SIZE", "CTIME", "MTIME", "NAME");
 
     struct lfs_info info;
     while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
         if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
             continue;
         }
-        printf("%-6s %-10"PRIu32" %s\n",
+        printf("%-6s %-10"PRIu32" %-12"PRIu64" %-12"PRIu64" %s\n",
                 (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE",
                 (uint32_t)info.size,
+                info.ctime,
+                info.mtime,
                 info.name);
     }
 
@@ -1748,6 +1756,10 @@ static const char *meta_tag_type_name(uint16_t type) {
         return "create";
     case LFS_TYPE_DELETE:
         return "delete";
+    case LFS_TYPE_CTIME:
+        return "ctime";
+    case LFS_TYPE_MTIME:
+        return "mtime";
     default:
         break;
     }
@@ -1821,6 +1833,13 @@ static void fmeta_print_tag_data(
         return;
     }
 
+    if ((type == LFS_TYPE_CTIME || type == LFS_TYPE_MTIME) && size >= 8) {
+        uint64_t ts;
+        memcpy(&ts, data, sizeof(ts));
+        fprintf(out, " value=%"PRIu64, sim_fromle64(ts));
+        return;
+    }
+
     if (meta_type_is_crc(type) && size >= 4) {
         uint32_t crc;
         memcpy(&crc, data, sizeof(crc));
@@ -1884,6 +1903,8 @@ static int cmd_create_file(sim_state_t *sim, int argc, char **argv) {
         fprintf(stderr, "create: failed to open %s: %d\n", path, err);
         return err;
     }
+    strncpy(file.path, path, sizeof(file.path) - 1);
+    file.path[sizeof(file.path) - 1] = '\0';
 
     err = lfs_file_close(&sim->lfs, &file);
     if (err) {
@@ -1920,6 +1941,8 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
         free(data);
         return err;
     }
+    strncpy(file.path, path, sizeof(file.path) - 1);
+    file.path[sizeof(file.path) - 1] = '\0';
 
     lfs_ssize_t res = lfs_file_write(&sim->lfs, &file, data, strlen(data));
     if (res < 0) {
@@ -2051,6 +2074,8 @@ static int cmd_cp(sim_state_t *sim, int argc, char **argv) {
         fprintf(stderr, "cp: failed to open %s: %d\n", src, err);
         return err;
     }
+    strncpy(in.path, src, sizeof(in.path) - 1);
+    in.path[sizeof(in.path) - 1] = '\0';
 
     err = lfs_file_open(&sim->lfs, &out, dst,
             LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
@@ -2059,6 +2084,8 @@ static int cmd_cp(sim_state_t *sim, int argc, char **argv) {
         lfs_file_close(&sim->lfs, &in);
         return err;
     }
+    strncpy(out.path, dst, sizeof(out.path) - 1);
+    out.path[sizeof(out.path) - 1] = '\0';
 
     uint8_t buffer[SIM_READ_CHUNK];
     while (true) {
@@ -2133,6 +2160,8 @@ static int cmd_stat(sim_state_t *sim, int argc, char **argv) {
     printf("path : %s\n", path);
     printf("type : %s\n", (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE");
     printf("size : %"PRIu32"\n", (uint32_t)info.size);
+    printf("ctime: %"PRIu64"\n", info.ctime);
+    printf("mtime: %"PRIu64"\n", info.mtime);
     return 0;
 }
 

@@ -111,6 +111,8 @@ enum lfs_type {
     LFS_TYPE_DIRSTRUCT      = 0x200,
     LFS_TYPE_CTZSTRUCT      = 0x202,
     LFS_TYPE_INLINESTRUCT   = 0x201,
+    LFS_TYPE_CTIME          = 0x301,
+    LFS_TYPE_MTIME          = 0x302,
     LFS_TYPE_SOFTTAIL       = 0x600,
     LFS_TYPE_HARDTAIL       = 0x601,
     LFS_TYPE_MOVESTATE      = 0x7ff,
@@ -120,6 +122,9 @@ enum lfs_type {
     LFS_FROM_MOVE           = 0x101,
     LFS_FROM_USERATTRS      = 0x102,
 };
+
+#define LFS_ATTR_CTIME 1
+#define LFS_ATTR_MTIME 2
 
 // File open flags
 enum lfs_open_flags {
@@ -278,6 +283,10 @@ struct lfs_info {
     // reduce RAM. LFS_NAME_MAX is stored in superblock and must be
     // respected by other littlefs drivers.
     char name[LFS_NAME_MAX+1];
+
+    // Creation and modification timestamps stored as user attributes.
+    uint64_t ctime;
+    uint64_t mtime;
 };
 
 // Custom attribute structure, used to describe custom attributes
@@ -367,6 +376,11 @@ typedef struct lfs_file {
     lfs_cache_t cache;
 
     const struct lfs_file_config *cfg;
+    char path[LFS_NAME_MAX+1];
+    bool mtimeflag;
+    bool ctimeflag;
+    uint64_t mtime;
+    uint64_t ctime;
 } lfs_file_t;
 
 typedef struct lfs_superblock {
