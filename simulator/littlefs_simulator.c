@@ -108,7 +108,11 @@ typedef struct lschk_entry {
     lfs_size_t size;
     lfs_block_t pair[2];
     uint16_t id;
+    uint16_t struct_type;
     bool duplicate;
+    bool has_name;
+    bool has_struct;
+    bool data_valid;
     lschk_status_t status;
 } lschk_entry_t;
 
@@ -335,7 +339,7 @@ static void print_help(void) {
     printf("Shell commands:\n");
     printf("  ls [path]\n");
     printf("  lschk [path]\n");
-    printf("  lsrepair [path]\n");
+    printf("  lsrepair [path] [--damaged]\n");
     printf("  cd <path>\n");
     printf("  pwd\n");
     printf("  cat <file>\n");
@@ -1172,6 +1176,36 @@ static int collect_lschk_entries(
     }
 
     for (size_t i = 0; i < count; i++) {
+        lfs_debug_entry_t probe;
+        err = lfs_debug_probeentry(&sim->lfs, path, entries[i].id, &probe);
+        if (err) {
+            entries[i].status = LSCHK_STATUS_DAMAGED;
+            continue;
+        }
+
+        entries[i].has_name = probe.has_name;
+        entries[i].has_struct = probe.has_struct;
+        entries[i].data_valid = probe.data_valid;
+        entries[i].struct_type = probe.struct_type;
+        if (probe.has_name && probe.name[0] != '\0') {
+            strncpy(entries[i].name, probe.name, sizeof(entries[i].name) - 1);
+            entries[i].name[sizeof(entries[i].name) - 1] = '\0';
+        }
+        if (probe.type != 0) {
+            entries[i].type = probe.type;
+        }
+        entries[i].size = probe.size;
+
+        if (!probe.has_struct) {
+            entries[i].status = LSCHK_STATUS_GHOST;
+        } else if (!probe.data_valid) {
+            entries[i].status = LSCHK_STATUS_DAMAGED;
+        } else {
+            entries[i].status = LSCHK_STATUS_REAL;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
         for (size_t j = i + 1; j < count; j++) {
             if (strcmp(entries[i].name, entries[j].name) == 0) {
                 entries[i].duplicate = true;
@@ -1242,6 +1276,11 @@ static int collect_lschk_entries(
             }
 
             processed[j] = true;
+            if (entries[j].status == LSCHK_STATUS_GHOST ||
+                    entries[j].status == LSCHK_STATUS_DAMAGED) {
+                continue;
+            }
+
             if (!winner_found) {
                 entries[j].status = LSCHK_STATUS_DAMAGED;
                 continue;
@@ -1323,7 +1362,23 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
     }
 
     char path[SIM_PATH_MAX];
-    const char *target = (argc >= 2) ? argv[1] : sim->current_path;
+    const char *target = sim->current_path;
+    bool remove_damaged = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--damaged") == 0) {
+            remove_damaged = true;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "lsrepair: unknown option %s\n", argv[i]);
+            return -1;
+        } else if (target == sim->current_path) {
+            target = argv[i];
+        } else {
+            fprintf(stderr, "lsrepair: unexpected argument %s\n", argv[i]);
+            return -1;
+        }
+    }
+
     if (resolve_path(sim, target, path, sizeof(path))) {
         fprintf(stderr, "Invalid path.\n");
         return -1;
@@ -1343,7 +1398,9 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
 
         int target_index = -1;
         for (size_t i = 0; i < count; i++) {
-            if (entries[i].status == LSCHK_STATUS_GHOST &&
+            if ((entries[i].status == LSCHK_STATUS_GHOST ||
+                    (remove_damaged &&
+                     entries[i].status == LSCHK_STATUS_DAMAGED)) &&
                     entries[i].type == LFS_TYPE_REG) {
                 target_index = (int)i;
                 break;
@@ -1358,8 +1415,16 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
                             entries[i].name, entries[i].id);
                     skipped++;
                 } else if (entries[i].status == LSCHK_STATUS_DAMAGED) {
-                    printf("skip  %s [damagedfile] id=%u : manual repair required\n",
-                            entries[i].name, entries[i].id);
+                    if (entries[i].type != LFS_TYPE_REG) {
+                        printf("skip  %s [damagedfile] id=%u : directory damaged entries are not auto-repaired\n",
+                                entries[i].name, entries[i].id);
+                    } else if (!remove_damaged) {
+                        printf("skip  %s [damagedfile] id=%u : use --damaged to allow repair\n",
+                                entries[i].name, entries[i].id);
+                    } else {
+                        printf("skip  %s [damagedfile] id=%u : manual repair required\n",
+                                entries[i].name, entries[i].id);
+                    }
                     skipped++;
                 }
             }
@@ -1372,13 +1437,18 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
 
         int remove_err = lfs_debug_removeghost(&sim->lfs, path, victim.name, victim.id);
         if (remove_err) {
-            printf("fail  %s [ghostfile] id=%u : %d\n",
-                    victim.name, victim.id, remove_err);
+            printf("fail  %s [%s] id=%u : %d\n",
+                    victim.name,
+                    lschk_status_name(victim.status),
+                    victim.id,
+                    remove_err);
             return remove_err;
         }
 
-        printf("fix   %s [ghostfile] id=%u removed\n",
-                victim.name, victim.id);
+        printf("fix   %s [%s] id=%u removed\n",
+                victim.name,
+                lschk_status_name(victim.status),
+                victim.id);
         removed++;
     }
 

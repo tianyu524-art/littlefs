@@ -383,6 +383,16 @@ typedef struct lfs_gstate {
     lfs_block_t pair[2];
 } lfs_gstate_t;
 
+typedef struct lfs_debug_entry {
+    char name[LFS_NAME_MAX+1];
+    uint8_t type;
+    uint16_t struct_type;
+    lfs_size_t size;
+    bool has_name;
+    bool has_struct;
+    bool data_valid;
+} lfs_debug_entry_t;
+
 // The littlefs filesystem type
 typedef struct lfs {
     lfs_cache_t rcache;
@@ -475,6 +485,16 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
         const char *name, uint16_t id);
 #endif
+
+// Probes a directory entry by exact directory path and id.
+//
+// This reads the entry metadata directly and validates the associated file
+// data path for inline/ctz files. The returned struct can be used to
+// distinguish missing name, missing struct, and broken data paths.
+//
+// Returns a negative error code on failure.
+int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
+        uint16_t id, lfs_debug_entry_t *entry);
 
 // Find info about a file or directory
 //

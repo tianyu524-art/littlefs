@@ -5373,6 +5373,161 @@ int lfs_unmount(lfs_t *lfs) {
     return err;
 }
 
+static int lfs_debug_fileopenat(lfs_t *lfs, lfs_file_t *file,
+        const lfs_mdir_t *mdir, uint16_t id) {
+    static const struct lfs_file_config defaults = {0};
+
+    memset(file, 0, sizeof(*file));
+    file->cfg = &defaults;
+    file->flags = LFS_O_RDONLY;
+    file->pos = 0;
+    file->off = 0;
+    file->block = LFS_BLOCK_NULL;
+    file->cache.buffer = NULL;
+    file->m = *mdir;
+    file->id = id;
+    file->type = LFS_TYPE_REG;
+    lfs_mlist_append(lfs, (struct lfs_mlist *)file);
+
+    lfs_stag_t tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x700, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_STRUCT, file->id, sizeof(file->ctz)),
+            &file->ctz);
+    if (tag < 0) {
+        goto cleanup;
+    }
+
+    if (file->cfg->buffer) {
+        file->cache.buffer = file->cfg->buffer;
+    } else {
+        file->cache.buffer = lfs_malloc(lfs->cfg->cache_size);
+        if (!file->cache.buffer) {
+            tag = LFS_ERR_NOMEM;
+            goto cleanup;
+        }
+    }
+
+    lfs_cache_zero(lfs, &file->cache);
+
+    if (lfs_tag_type3(tag) == LFS_TYPE_INLINESTRUCT) {
+        file->ctz.head = LFS_BLOCK_INLINE;
+        file->ctz.size = lfs_tag_size(tag);
+        file->flags |= LFS_F_INLINE;
+        file->cache.block = file->ctz.head;
+        file->cache.off = 0;
+        file->cache.size = lfs->cfg->cache_size;
+
+        if (file->ctz.size > 0) {
+            lfs_stag_t res = lfs_dir_get(lfs, &file->m,
+                    LFS_MKTAG(0x700, 0x3ff, 0),
+                    LFS_MKTAG(LFS_TYPE_STRUCT, file->id,
+                        lfs_min(file->cache.size, 0x3fe)),
+                    file->cache.buffer);
+            if (res < 0) {
+                tag = res;
+                goto cleanup;
+            }
+        }
+    } else if (lfs_tag_type3(tag) == LFS_TYPE_CTZSTRUCT) {
+        lfs_ctz_fromle32(&file->ctz);
+    } else {
+        tag = LFS_ERR_CORRUPT;
+        goto cleanup;
+    }
+
+    return 0;
+
+cleanup:
+#ifndef LFS_READONLY
+    file->flags |= LFS_F_ERRED;
+#endif
+    lfs_file_rawclose(lfs, file);
+    return (int)tag;
+}
+
+int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
+        uint16_t id, lfs_debug_entry_t *entry) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_debug_probeentry(%p, \"%s\", %"PRIu16", %p)",
+            (void*)lfs, dirpath, id, (void*)entry);
+
+    memset(entry, 0, sizeof(*entry));
+
+    lfs_dir_t dir;
+    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    if (err) {
+        goto cleanup;
+    }
+
+    lfs_stag_t tag = lfs_dir_get(lfs, &dir.m, LFS_MKTAG(0x780, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_NAME, id, lfs->name_max+1), entry->name);
+    if (tag >= 0) {
+        entry->has_name = true;
+        entry->type = lfs_tag_type3(tag);
+    } else if (tag != LFS_ERR_NOENT) {
+        err = (int)tag;
+        goto close_dir;
+    }
+
+    struct lfs_ctz ctz;
+    tag = lfs_dir_get(lfs, &dir.m, LFS_MKTAG(0x700, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_STRUCT, id, sizeof(ctz)), &ctz);
+    if (tag >= 0) {
+        entry->has_struct = true;
+        entry->struct_type = lfs_tag_type3(tag);
+    } else if (tag != LFS_ERR_NOENT) {
+        err = (int)tag;
+        goto close_dir;
+    }
+
+    if (entry->type == LFS_TYPE_DIR && entry->has_struct &&
+            entry->struct_type == LFS_TYPE_DIRSTRUCT) {
+        lfs_block_t pair[2];
+        memcpy(pair, &ctz, sizeof(pair));
+        lfs_pair_fromle32(pair);
+        entry->size = 0;
+        entry->data_valid = pair[0] < lfs->cfg->block_count
+                && pair[1] < lfs->cfg->block_count;
+    } else if (entry->type == LFS_TYPE_REG && entry->has_struct) {
+        lfs_file_t file;
+        err = lfs_debug_fileopenat(lfs, &file, &dir.m, id);
+        if (err) {
+            entry->data_valid = false;
+            err = 0;
+        } else {
+            entry->size = file.ctz.size;
+            entry->struct_type = (file.flags & LFS_F_INLINE)
+                    ? LFS_TYPE_INLINESTRUCT
+                    : LFS_TYPE_CTZSTRUCT;
+            entry->data_valid = true;
+
+            uint8_t buffer[256];
+            while (file.pos < file.ctz.size) {
+                lfs_size_t chunk = lfs_min((lfs_size_t)sizeof(buffer),
+                        file.ctz.size - file.pos);
+                lfs_ssize_t res = lfs_file_rawread(lfs, &file, buffer, chunk);
+                if (res < 0 || (lfs_size_t)res != chunk) {
+                    entry->data_valid = false;
+                    break;
+                }
+            }
+
+            lfs_file_rawclose(lfs, &file);
+        }
+    }
+
+    err = 0;
+
+close_dir:
+    lfs_dir_rawclose(lfs, &dir);
+cleanup:
+    LFS_TRACE("lfs_debug_probeentry -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+
 #ifndef LFS_READONLY
 int lfs_remove(lfs_t *lfs, const char *path) {
     int err = LFS_LOCK(lfs->cfg);
@@ -5437,12 +5592,12 @@ int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
     lfs_mdir_t cwd;
     const char *lookup = path;
     lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &lookup, NULL);
-    if (tag < 0) {
+    if (tag < 0 && tag != LFS_ERR_NOENT) {
         err = (int)tag;
         goto close_dir;
     }
 
-    if (lfs_pair_cmp(cwd.pair, dir.m.pair) == 0 && lfs_tag_id(tag) == id) {
+    if (tag >= 0 && lfs_pair_cmp(cwd.pair, dir.m.pair) == 0 && lfs_tag_id(tag) == id) {
         err = LFS_ERR_EXIST;
         goto close_dir;
     }
