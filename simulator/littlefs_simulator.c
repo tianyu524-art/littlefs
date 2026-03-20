@@ -193,6 +193,7 @@ static void fprint_hexdump_with_base(
         FILE *out, const uint8_t *data, size_t size, uint32_t base_offset);
 static void fprint_erased_block_preview(FILE *out, size_t block_size);
 static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size);
+static size_t inspect_block_dump_size(const uint8_t *buffer, size_t block_size);
 static int read_device_bytes(
         sim_state_t *sim, uint64_t offset, void *buffer, size_t size);
 static int read_device_block(
@@ -1650,6 +1651,29 @@ static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size
     return lfs_min(rounded, block_size);
 }
 
+static size_t inspect_block_dump_size(const uint8_t *buffer, size_t block_size) {
+    if (block_size < 128) {
+        return block_size;
+    }
+
+    for (size_t start = 0; start + 128 <= block_size; start++) {
+        bool erased = true;
+        for (size_t i = 0; i < 128; i++) {
+            if (buffer[start + i] != 0xff) {
+                erased = false;
+                break;
+            }
+        }
+
+        if (erased) {
+            size_t rounded = (start / 16) * 16;
+            return lfs_min(rounded, block_size);
+        }
+    }
+
+    return block_size;
+}
+
 static int inspect_mark_used_block(void *data, lfs_block_t block) {
     block_usage_map_t *map = data;
     if (block < map->count) {
@@ -2288,11 +2312,18 @@ static int cmd_inspect(sim_state_t *sim, int argc, char **argv) {
 
         int err = read_device_block(sim, (lfs_block_t)block_value, buffer);
         if (err == 0) {
+            size_t dump_size = inspect_block_dump_size(buffer, sim->storage.block_size);
             printf("Block %"PRIu32" (offset 0x%"PRIx64", %s)\n",
                     (uint32_t)block_value,
                     (uint64_t)block_value * sim->storage.block_size,
                     buffer_is_erased(buffer, sim->storage.block_size) ? "erased" : "programmed");
-            print_hexdump(buffer, sim->storage.block_size);
+            if (dump_size > 0) {
+                print_hexdump(buffer, dump_size);
+            }
+            if (dump_size < sim->storage.block_size) {
+                printf("... stopped at first 128-byte erased run (offset 0x%08"PRIx32")\n",
+                        (uint32_t)dump_size);
+            }
         }
         free(buffer);
         return err;
