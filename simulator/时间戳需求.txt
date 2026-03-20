@@ -1,0 +1,49 @@
+
+
+时间戳需求，需要系统支持查询文件修改时间和创建时间的功能
+1、LFS_TYPE_USERATTR 新增两个字段，0x301 表示创建时间ctime， 0x302 表示修改时间mtime
+2、文件的时间规则更新如下
+	open(创建问题)：更新ctime和mtime
+	open(仅打开)：时间戳不更新
+	write 写文件：mtime 更新
+	read 读文件：不涉及
+	close 文件：不涉及time更新
+	rename 修改文件名或者目录变更 更新ctime
+	remove 不涉及
+3、目录的时间规则更新如下
+	mkdir(创建问题)：更新ctime和mtime
+	opendir(打开)：时间戳不更新
+	rename ：更新ctime和mtime 写文件：mtime 更新
+	closedir 文件：时间戳不更新
+
+4、数据结构定义：时间戳都是u64
+	4.1 struct lfs_info 结构体中增加两个u64的成员分别表示ctime和mtime
+	4.2 lfs_file_t 结构体新增四个字段
+			4.2.1 	新增字符串 path[LFS_NAME_MAX+1], 保存当前文件的全路径
+					在cmd_create_file  cmd_cp 和  cmd_write 命令中，将全路径拷贝给 lfs_file_t 的 path
+			4.2.2	新增mtimeflag，ctimeflag，mtime和ctime四个成员
+					mtimeflag，ctimeflag 默认为false，mtime和ctime默认为0
+					mtime和ctime保存当前系统最新的时间戳
+					当mtime变化是，mtimeflag设置为true
+					当ctime变化时，ctimeflag设置为true
+					
+			4.2.3 时间戳的更新机制
+					写入时间戳场景
+						写文件操作：
+							多次write时，第一次write设置mtimeflag，为true多次write时，第一次write设置mtimeflag为true ，后面如果多次更新，仅更新mtime时间，不固话到flash
+						rename操作：
+							rename的newname的mtime为oldname的mtime，ctime为当前时间戳				
+						当文件close时，判断flag，flag为true，则把时间戳写入flash
+						
+					获取时间戳
+						判断flag是否为true，如果为true，从结构体成员获取时间戳
+						如果为flash，则从flash读取，如果flash读不到，时间戳默认为0
+5、时间戳获取方式
+		获取当前系统时间戳，返回U64的结果
+6、在ls中显示ctime和mtime
+					
+				
+					
+	
+	
+	
