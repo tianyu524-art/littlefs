@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -155,6 +156,7 @@ static int resolve_path(
 static char *join_args(int argc, char **argv, int start);
 static int split_command(char *line, char **argv, int max_args);
 static char *trim_whitespace(char *text);
+static void fill_random_bytes(uint8_t *buffer, size_t size);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
@@ -222,6 +224,7 @@ int main(int argc, char **argv) {
     cli_options_t options;
     memset(&options, 0, sizeof(options));
     detect_executable_dir(argv[0], g_exe_dir, sizeof(g_exe_dir));
+    srand((unsigned int)time(NULL));
 
     int err = parse_cli(argc, argv, &options);
     if (err) {
@@ -346,7 +349,7 @@ static void print_help(void) {
     printf("  cat <file>\n");
     printf("  hexdump <file>\n");
     printf("  create <file>\n");
-    printf("  write <file> <data>\n");
+    printf("  write <file> <size> [data]\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -1047,6 +1050,12 @@ static char *trim_whitespace(char *text) {
     return text;
 }
 
+static void fill_random_bytes(uint8_t *buffer, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)(rand() & 0xff);
+    }
+}
+
 static const char *lschk_status_name(lschk_status_t status) {
     switch (status) {
     case LSCHK_STATUS_REAL:
@@ -1652,13 +1661,13 @@ static size_t effective_block_dump_size(const uint8_t *buffer, size_t block_size
 }
 
 static size_t inspect_block_dump_size(const uint8_t *buffer, size_t block_size) {
-    if (block_size < 128) {
+    if (block_size < 1024) {
         return block_size;
     }
 
-    for (size_t start = 0; start + 128 <= block_size; start++) {
+    for (size_t start = 0; start + 1024 <= block_size; start++) {
         bool erased = true;
-        for (size_t i = 0; i < 128; i++) {
+        for (size_t i = 0; i < 1024; i++) {
             if (buffer[start + i] != 0xff) {
                 erased = false;
                 break;
@@ -1920,7 +1929,7 @@ static int cmd_create_file(sim_state_t *sim, int argc, char **argv) {
 
 static int cmd_write(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 3) {
-        fprintf(stderr, "usage: write <file> <data>\n");
+        fprintf(stderr, "usage: write <file> <size> [data]\n");
         return -1;
     }
 
@@ -1930,10 +1939,36 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
         return -1;
     }
 
-    char *data = join_args(argc, argv, 2);
-    if (!data) {
-        fprintf(stderr, "write: out of memory\n");
+    lfs_size_t size = 0;
+    if (parse_size_arg(argv[2], &size)) {
+        fprintf(stderr, "write: invalid size %s\n", argv[2]);
         return -1;
+    }
+
+    char *data = NULL;
+    size_t data_len = 0;
+    if (argc >= 4) {
+        data = join_args(argc, argv, 3);
+        if (!data) {
+            fprintf(stderr, "write: out of memory\n");
+            return -1;
+        }
+        data_len = strlen(data);
+    }
+
+    uint8_t *buffer = malloc(size > 0 ? size : 1);
+    if (!buffer) {
+        fprintf(stderr, "write: out of memory\n");
+        free(data);
+        return -1;
+    }
+
+    if (size > 0) {
+        fill_random_bytes(buffer, size);
+        if (data_len > 0) {
+            size_t copy_len = data_len < size ? data_len : size;
+            memcpy(buffer, data, copy_len);
+        }
     }
 
     lfs_file_t file;
@@ -1941,19 +1976,22 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
             LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
     if (err) {
         fprintf(stderr, "write: failed to open %s: %d\n", path, err);
+        free(buffer);
         free(data);
         return err;
     }
 
-    lfs_ssize_t res = lfs_file_write(&sim->lfs, &file, data, strlen(data));
+    lfs_ssize_t res = lfs_file_write(&sim->lfs, &file, buffer, size);
     if (res < 0) {
         fprintf(stderr, "write: failed to write %s: %d\n", path, (int)res);
         lfs_file_close(&sim->lfs, &file);
+        free(buffer);
         free(data);
         return (int)res;
     }
 
     err = lfs_file_close(&sim->lfs, &file);
+    free(buffer);
     free(data);
     if (err) {
         fprintf(stderr, "write: failed to close %s: %d\n", path, err);
@@ -2321,7 +2359,7 @@ static int cmd_inspect(sim_state_t *sim, int argc, char **argv) {
                 print_hexdump(buffer, dump_size);
             }
             if (dump_size < sim->storage.block_size) {
-                printf("... stopped at first 128-byte erased run (offset 0x%08"PRIx32")\n",
+                printf("... stopped at first 1024-byte erased run (offset 0x%08"PRIx32")\n",
                         (uint32_t)dump_size);
             }
         }
