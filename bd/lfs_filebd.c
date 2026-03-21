@@ -10,10 +10,35 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+volatile int g_flash_fault_injection_enabled = 0;
+
+#ifdef _WIN32
+static DWORD WINAPI lfs_filebd_fault_worker(LPVOID arg) {
+    (void)arg;
+    DWORD delay_ms = 100u + (DWORD)(rand() % 401);
+    Sleep(delay_ms);
+    g_flash_fault_injection_enabled = 1;
+    return 0;
+}
+#else
+static void *lfs_filebd_fault_worker(void *arg) {
+    (void)arg;
+    unsigned delay_ms = 100u + (unsigned)(rand() % 401);
+    usleep(delay_ms * 1000u);
+    g_flash_fault_injection_enabled = 1;
+    return NULL;
+}
 #endif
 
 int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
@@ -31,6 +56,8 @@ int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
             path, (void*)bdcfg, bdcfg->erase_value);
     lfs_filebd_t *bd = cfg->context;
     bd->cfg = bdcfg;
+    g_flash_fault_injection_enabled = 0;
+    srand((unsigned)time(NULL));
 
     // open file
     #ifdef _WIN32
@@ -44,6 +71,18 @@ int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
         LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", err);
         return err;
     }
+
+#ifdef _WIN32
+    HANDLE worker = CreateThread(NULL, 0, lfs_filebd_fault_worker, NULL, 0, NULL);
+    if (worker) {
+        CloseHandle(worker);
+    }
+#else
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, lfs_filebd_fault_worker, NULL) == 0) {
+        pthread_detach(worker);
+    }
+#endif
 
     LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", 0);
     return 0;
@@ -150,21 +189,42 @@ int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
         }
     }
 
+    // inject a single-byte fault into small writes once the fault switch is on
+    uint8_t *fault_buffer = NULL;
+    const void *write_buffer = buffer;
+    if (g_flash_fault_injection_enabled && size > 0 && size < 256) {
+        fault_buffer = malloc(size);
+        if (!fault_buffer) {
+            int err = -ENOMEM;
+            LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+            return err;
+        }
+
+        memcpy(fault_buffer, buffer, size);
+        lfs_size_t fault_offset = (lfs_size_t)(rand() % size);
+        fault_buffer[fault_offset] = 0xff;
+        write_buffer = fault_buffer;
+    }
+
     // program data
     off_t res1 = lseek(bd->fd,
             (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
     if (res1 < 0) {
         int err = -errno;
+        free(fault_buffer);
         LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
         return err;
     }
 
-    ssize_t res2 = write(bd->fd, buffer, size);
+    ssize_t res2 = write(bd->fd, write_buffer, size);
     if (res2 < 0) {
         int err = -errno;
+        free(fault_buffer);
         LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
         return err;
     }
+
+    free(fault_buffer);
 
     LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", 0);
     return 0;
