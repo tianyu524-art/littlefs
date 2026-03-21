@@ -19,8 +19,13 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
 #include <windows.h>
 #define strcasecmp _stricmp
+#define close _close
+#define dup _dup
+#define dup2 _dup2
+#define fileno _fileno
 #else
 #include <unistd.h>
 #endif
@@ -171,6 +176,7 @@ static int cmd_lschk(sim_state_t *sim, int argc, char **argv);
 static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv);
 static int cmd_cd(sim_state_t *sim, int argc, char **argv);
 static int cmd_pwd(sim_state_t *sim, int argc, char **argv);
+static int cmd_read(sim_state_t *sim, int argc, char **argv);
 static int cmd_cat(sim_state_t *sim, int argc, char **argv);
 static int cmd_hexdump(sim_state_t *sim, int argc, char **argv);
 static int cmd_create_file(sim_state_t *sim, int argc, char **argv);
@@ -353,6 +359,7 @@ static void print_help(void) {
     printf("  lsrepair [path] [--damaged]\n");
     printf("  cd <path>\n");
     printf("  pwd\n");
+    printf("  read <file>\n");
     printf("  cat <file>\n");
     printf("  hexdump <file>\n");
     printf("  create <file>\n");
@@ -1606,6 +1613,31 @@ static int cmd_pwd(sim_state_t *sim, int argc, char **argv) {
     return 0;
 }
 
+static int cmd_read(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: read <file>\n");
+        return -1;
+    }
+
+    char path[SIM_PATH_MAX];
+    if (resolve_path(sim, argv[1], path, sizeof(path))) {
+        fprintf(stderr, "read: invalid path\n");
+        return -1;
+    }
+
+    uint8_t *buffer = NULL;
+    lfs_size_t size = 0;
+    int err = read_file_alloc(sim, path, &buffer, &size);
+    if (err) {
+        fprintf(stderr, "read: %s: %d\n", path, err);
+        return err;
+    }
+
+    free(buffer);
+    printf("Read %"PRIu32" bytes from %s\n", (uint32_t)size, path);
+    return 0;
+}
+
 static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer, lfs_size_t *size) {
     struct lfs_info info;
     int err = lfs_stat(&sim->lfs, path, &info);
@@ -2134,7 +2166,7 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
 
 static int cmd_test(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
-        fprintf(stderr, "usage: test <count>\n");
+        fprintf(stderr, "usage: test <count> [output-file]\n");
         return -1;
     }
 
@@ -2146,6 +2178,40 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
 
     const char *target_dir = "/lfs0/LOG/PWR";
     const int pwr_chunk_sizes[3] = {600, 625, 650};
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], "test", output_path, sizeof(output_path));
+        log_file = fopen(output_path, "w");
+        if (!log_file) {
+            fprintf(stderr, "test: failed to open output file %s: %s\n",
+                    output_path, strerror(errno));
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0 ||
+                dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            if (saved_stdout >= 0) {
+                close(saved_stdout);
+            }
+            if (saved_stderr >= 0) {
+                close(saved_stderr);
+            }
+            fclose(log_file);
+            fprintf(stderr, "test: failed to redirect output\n");
+            return -1;
+        }
+
+        printf("test log path: %s\n", output_path);
+    }
 
     struct lfs_info info;
     if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
@@ -2178,12 +2244,12 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
         if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
             err = run_internal_command(sim, "create PWR.IDX");
             if (err) {
-                return err;
+                goto cleanup;
             }
         } else {
-            err = run_internal_command(sim, "cat PWR.IDX");
+            err = run_internal_command(sim, "read PWR.IDX");
             if (err) {
-                return err;
+                goto cleanup;
             }
         }
 
@@ -2195,7 +2261,7 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
                 &pwr_count, &have_any, &min_index, &max_index);
         if (err) {
             fprintf(stderr, "test: failed to scan %s: %d\n", sim->current_path, err);
-            return err;
+            goto cleanup;
         }
 
         uint32_t next_index = have_any ? (max_index + 1u) : 0u;
@@ -2204,7 +2270,7 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
 
         err = run_internal_command(sim, "create %s", new_name);
         if (err) {
-            return err;
+            goto cleanup;
         }
 
         int write_count = 40 + (rand() % 21);
@@ -2212,14 +2278,14 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
             int chunk = pwr_chunk_sizes[rand() % 3];
             err = run_internal_command(sim, "write %s %d --append", new_name, chunk);
             if (err) {
-                return err;
+                goto cleanup;
             }
         }
 
         int idx_append = 800 + (rand() % 201);
         err = run_internal_command(sim, "write PWR.IDX %d --append", idx_append);
         if (err) {
-            return err;
+            goto cleanup;
         }
 
         if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) == 0 &&
@@ -2228,43 +2294,27 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
             if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
                 err = run_internal_command(sim, "rm PWR.IDX.tmp");
                 if (err) {
-                    return err;
+                    goto cleanup;
                 }
             }
 
             err = run_internal_command(sim, "cp PWR.IDX PWR.IDX.tmp");
             if (err) {
-                return err;
+                goto cleanup;
             }
             err = run_internal_command(sim, "rm PWR.IDX");
             if (err) {
-                return err;
+                goto cleanup;
             }
             err = run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
             if (err) {
-                return err;
-            }
-        }
-
-        err = scan_pwr_files(sim, sim->current_path,
-                &pwr_count, &have_any, &min_index, &max_index);
-        if (err) {
-            fprintf(stderr, "test: failed to scan %s: %d\n", sim->current_path, err);
-            return err;
-        }
-
-        if (pwr_count > 5 && have_any) {
-            char oldest_name[32];
-            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
-            err = run_internal_command(sim, "rm %s", oldest_name);
-            if (err) {
-                return err;
+                goto cleanup;
             }
         }
 
         err = run_internal_command(sim, "lschk .");
         if (err) {
-            return err;
+            goto cleanup;
         }
 
         lschk_entry_t *entries = NULL;
@@ -2272,7 +2322,7 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
         err = collect_lschk_entries(sim, sim->current_path, &entries, &entry_count);
         if (err) {
             fprintf(stderr, "test: lschk scan failed: %d\n", err);
-            return err;
+            goto cleanup;
         }
 
         bool all_real = true;
@@ -2287,12 +2337,42 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv) {
         if (!all_real) {
             printf("test paused at iteration %"PRIu32": non-real entries detected\n",
                     (uint32_t)(iteration + 1));
-            return 0;
+            err = 0;
+            goto cleanup;
+        }
+
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "test: failed to scan %s: %d\n", sim->current_path, err);
+            goto cleanup;
+        }
+
+        if (pwr_count > 5 && have_any) {
+            char oldest_name[32];
+            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+            err = run_internal_command(sim, "rm %s", oldest_name);
+            if (err) {
+                goto cleanup;
+            }
         }
     }
 
     printf("test completed: %"PRIu32" iterations\n", (uint32_t)count);
-    return 0;
+    err = 0;
+
+cleanup:
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("test output saved to %s\n", output_path);
+    }
+    return err;
 }
 
 static int cmd_mkdir(sim_state_t *sim, int argc, char **argv) {
@@ -2984,6 +3064,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "pwd") == 0) {
         return cmd_pwd(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "read") == 0) {
+        return cmd_read(sim, argc, argv);
     }
     if (strcmp(argv[0], "cat") == 0) {
         return cmd_cat(sim, argc, argv);
