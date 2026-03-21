@@ -34,6 +34,8 @@
 #include "lfs.h"
 #include "lfs_util.h"
 
+extern volatile int g_flash_fault_injection_start;
+
 #define SIM_PATH_MAX 1024
 #define SIM_LINE_MAX 4096
 #define SIM_ARGV_MAX 64
@@ -173,6 +175,7 @@ static int scan_pwr_files(sim_state_t *sim, const char *path,
         size_t *count_out, bool *have_any_out, uint32_t *min_index_out,
         uint32_t *max_index_out);
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
+static int cmd_faulttest(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
 
@@ -238,6 +241,7 @@ static void build_default_meta_dump_name(
 static void resolve_export_path(
         const char *requested, const char *target_path,
         char *buffer, size_t buffer_size);
+static void emit_progress_tick(int saved_stdout);
 static int meta_dump_target(sim_state_t *sim, const char *path,
         bool block_only, bool parsed_only, FILE *out);
 
@@ -374,6 +378,7 @@ static void print_help(void) {
     printf("  write <file> <size> [data] [--append]\n");
     printf("  ops <name>\n");
     printf("  renametest <count>\n");
+    printf("  faulttest <count> [output-file]\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -1965,6 +1970,19 @@ static void resolve_export_path(
 #endif
 }
 
+static void emit_progress_tick(int saved_stdout) {
+    const char dot = '.';
+    int fd = (saved_stdout >= 0) ? saved_stdout : fileno(stdout);
+    if (fd < 0) {
+        return;
+    }
+#ifdef _WIN32
+    _write(fd, &dot, 1);
+#else
+    write(fd, &dot, 1);
+#endif
+}
+
 static const char *meta_tag_type_name(uint16_t type) {
     switch (type) {
     case LFS_TYPE_REG:
@@ -2386,6 +2404,230 @@ static int cmd_renametest(sim_state_t *sim, int argc, char **argv) {
 
     printf("renametest completed: %"PRIu32" iterations\n", (uint32_t)count);
     return 0;
+}
+
+static int cmd_faulttest(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: faulttest <count> [output-file]\n");
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "faulttest: invalid count %s\n", argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+    int err = 0;
+    struct lfs_info info;
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], "faulttest", output_path, sizeof(output_path));
+        log_file = fopen(output_path, "w");
+        if (!log_file) {
+            fprintf(stderr, "faulttest: failed to open output file %s: %s\n",
+                    output_path, strerror(errno));
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0 ||
+                dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            if (saved_stdout >= 0) {
+                close(saved_stdout);
+            }
+            if (saved_stderr >= 0) {
+                close(saved_stderr);
+            }
+            fclose(log_file);
+            fprintf(stderr, "faulttest: failed to redirect output\n");
+            return -1;
+        }
+
+        printf("faulttest log path: %s\n", output_path);
+    }
+
+    g_flash_fault_injection_start = 1;
+
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) {
+                goto cleanup;
+            }
+        }
+    }
+
+    err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        goto cleanup;
+    }
+
+    for (lfs_size_t iteration = 0; iteration < count; iteration++) {
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+            err = run_internal_command(sim, "create PWR.IDX");
+            if (err) {
+                goto cleanup;
+            }
+        }
+
+        size_t pwr_count = 0;
+        bool have_any = false;
+        uint32_t min_index = 0;
+        uint32_t max_index = 0;
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "faulttest: failed to scan %s: %d\n",
+                    sim->current_path, err);
+            goto cleanup;
+        }
+
+        uint32_t next_index = have_any ? (max_index + 1u) : 0u;
+        char new_name[32];
+        snprintf(new_name, sizeof(new_name), "%08"PRIu32".PWR", next_index);
+
+        err = run_internal_command(sim, "create %s", new_name);
+        if (err) {
+            goto cleanup;
+        }
+
+        int write_count = 10 + (rand() % 11);
+        for (int i = 0; i < write_count; i++) {
+            int chunk = (3 + (rand() % 7)) * 1024;
+            g_flash_fault_injection_start = ((i % 2) == 0) ? 1 : 0;
+            for (int repeat = 0; repeat < 2; repeat++) {
+                err = run_internal_command(sim, "write %s %d --append", new_name, chunk);
+                if (err) {
+                    goto cleanup;
+                }
+
+                err = run_internal_command(sim, "write PWR.IDX 988 --append");
+                if (err) {
+                    goto cleanup;
+                }
+            }
+        }
+
+        g_flash_fault_injection_start = 1;
+        err = run_internal_command(sim, "write PWR.IDX %d --append", 800 + (rand() % 201));
+        if (err) {
+            goto cleanup;
+        }
+
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) == 0 &&
+                info.type == LFS_TYPE_REG &&
+                info.size > (30u * 1024u)) {
+            g_flash_fault_injection_start = 0;
+            if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
+                err = run_internal_command(sim, "rm PWR.IDX.tmp");
+                if (err) {
+                    goto cleanup;
+                }
+            }
+
+            err = run_internal_command(sim, "cp PWR.IDX PWR.IDX.tmp");
+            if (err) {
+                goto cleanup;
+            }
+            err = run_internal_command(sim, "rm PWR.IDX");
+            if (err) {
+                goto cleanup;
+            }
+            err = run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+            if (err) {
+                goto cleanup;
+            }
+        }
+
+        err = run_internal_command(sim, "lschk .");
+        if (err) {
+            goto cleanup;
+        }
+
+        lschk_entry_t *entries = NULL;
+        size_t entry_count = 0;
+        err = collect_lschk_entries(sim, sim->current_path, &entries, &entry_count);
+        if (err) {
+            fprintf(stderr, "faulttest: lschk scan failed: %d\n", err);
+            goto cleanup;
+        }
+
+        bool all_real = true;
+        for (size_t i = 0; i < entry_count; i++) {
+            if (entries[i].status != LSCHK_STATUS_REAL) {
+                all_real = false;
+                break;
+            }
+        }
+        free(entries);
+
+        if (!all_real) {
+            printf("faulttest paused at iteration %"PRIu32
+                    ": non-real entries detected\n",
+                    (uint32_t)(iteration + 1));
+            err = 0;
+            goto cleanup;
+        }
+
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "faulttest: failed to rescan %s: %d\n",
+                    sim->current_path, err);
+            goto cleanup;
+        }
+
+        g_flash_fault_injection_start = 0;
+        if (pwr_count > 10 && have_any) {
+            char oldest_name[32];
+            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+            err = run_internal_command(sim, "rm %s", oldest_name);
+            if (err) {
+                goto cleanup;
+            }
+        }
+
+        emit_progress_tick(saved_stdout);
+    }
+
+    printf("\nfaulttest completed: %"PRIu32" iterations\n", (uint32_t)count);
+    err = 0;
+
+cleanup:
+    g_flash_fault_injection_start = 0;
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("\nfaulttest output saved to %s\n", output_path);
+    }
+    return err;
 }
 
 static int cmd_test(sim_state_t *sim, int argc, char **argv) {
@@ -3309,6 +3551,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "renametest") == 0) {
         return cmd_renametest(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "faulttest") == 0) {
+        return cmd_faulttest(sim, argc, argv);
     }
     if (strcmp(argv[0], "mkdir") == 0) {
         return cmd_mkdir(sim, argc, argv);
