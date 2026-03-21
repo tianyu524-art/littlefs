@@ -89,6 +89,9 @@ typedef struct sim_state {
     bool mounted;
     char image_path[SIM_PATH_MAX];
     char current_path[SIM_PATH_MAX];
+    bool fdwrite_open;
+    lfs_file_t fdwrite;
+    char fdwrite_path[SIM_PATH_MAX];
 } sim_state_t;
 
 typedef struct tree_stats {
@@ -169,6 +172,7 @@ static int scan_pwr_files(sim_state_t *sim, const char *path,
         size_t *count_out, bool *have_any_out, uint32_t *min_index_out,
         uint32_t *max_index_out);
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
+static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
@@ -181,6 +185,7 @@ static int cmd_cat(sim_state_t *sim, int argc, char **argv);
 static int cmd_hexdump(sim_state_t *sim, int argc, char **argv);
 static int cmd_create_file(sim_state_t *sim, int argc, char **argv);
 static int cmd_write(sim_state_t *sim, int argc, char **argv);
+static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 static int cmd_mkdir(sim_state_t *sim, int argc, char **argv);
 static int cmd_rm(sim_state_t *sim, int argc, char **argv);
 static int cmd_cp(sim_state_t *sim, int argc, char **argv);
@@ -364,6 +369,7 @@ static void print_help(void) {
     printf("  hexdump <file>\n");
     printf("  create <file>\n");
     printf("  write <file> <size> [data] [--append]\n");
+    printf("  ops <name>\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -816,9 +822,16 @@ static int file_exists(const char *path) {
 static void sim_state_init(sim_state_t *sim) {
     memset(sim, 0, sizeof(*sim));
     strcpy(sim->current_path, "/");
+    sim->fdwrite_path[0] = '\0';
 }
 
 static void sim_state_deinit(sim_state_t *sim) {
+    if (sim->mounted && sim->fdwrite_open) {
+        lfs_file_close(&sim->lfs, &sim->fdwrite);
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+    }
+
     if (sim->mounted) {
         lfs_unmount(&sim->lfs);
         sim->mounted = false;
@@ -906,6 +919,16 @@ static int sim_unmount(sim_state_t *sim) {
         return 0;
     }
 
+    if (sim->fdwrite_open) {
+        int close_err = lfs_file_close(&sim->lfs, &sim->fdwrite);
+        if (close_err) {
+            fprintf(stderr, "fdwrite close before unmount failed: %d\n", close_err);
+            return close_err;
+        }
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+    }
+
     int err = lfs_unmount(&sim->lfs);
     if (err) {
         fprintf(stderr, "Unmount failed: %d\n", err);
@@ -919,6 +942,16 @@ static int sim_unmount(sim_state_t *sim) {
 
 static int sim_format(sim_state_t *sim) {
     if (sim->mounted) {
+        if (sim->fdwrite_open) {
+            int close_err = lfs_file_close(&sim->lfs, &sim->fdwrite);
+            if (close_err) {
+                fprintf(stderr, "fdwrite close before format failed: %d\n", close_err);
+                return close_err;
+            }
+            sim->fdwrite_open = false;
+            sim->fdwrite_path[0] = '\0';
+        }
+
         int err = lfs_unmount(&sim->lfs);
         if (err) {
             fprintf(stderr, "Unmount before format failed: %d\n", err);
@@ -2164,6 +2197,122 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
     return 0;
 }
 
+static int cmd_ops(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: ops <name>\n");
+        return -1;
+    }
+
+    char rel_tmp1[SIM_PATH_MAX];
+    char rel_tmp[SIM_PATH_MAX];
+    char rel_final[SIM_PATH_MAX];
+    char path_tmp1[SIM_PATH_MAX];
+    char path_tmp[SIM_PATH_MAX];
+    char path_final[SIM_PATH_MAX];
+
+    snprintf(rel_tmp1, sizeof(rel_tmp1), "%s.PWR.tmp1", argv[1]);
+    snprintf(rel_tmp, sizeof(rel_tmp), "%s.PWR.tmp", argv[1]);
+    snprintf(rel_final, sizeof(rel_final), "%s.PWR", argv[1]);
+
+    if (resolve_path(sim, rel_tmp1, path_tmp1, sizeof(path_tmp1)) ||
+            resolve_path(sim, rel_tmp, path_tmp, sizeof(path_tmp)) ||
+            resolve_path(sim, rel_final, path_final, sizeof(path_final))) {
+        fprintf(stderr, "ops: invalid name\n");
+        return -1;
+    }
+
+    if (sim->fdwrite_open) {
+        int close_err = lfs_file_close(&sim->lfs, &sim->fdwrite);
+        if (close_err) {
+            fprintf(stderr, "ops: failed to close previous fdwrite %s: %d\n",
+                    sim->fdwrite_path, close_err);
+            return close_err;
+        }
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+    }
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path_tmp1, LFS_O_CREAT | LFS_O_WRONLY);
+    if (err) {
+        fprintf(stderr, "ops: failed to create %s: %d\n", path_tmp1, err);
+        return err;
+    }
+    err = lfs_file_close(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "ops: failed to close %s: %d\n", path_tmp1, err);
+        return err;
+    }
+
+    err = lfs_file_open(&sim->lfs, &file, path_tmp, LFS_O_CREAT | LFS_O_WRONLY);
+    if (err) {
+        fprintf(stderr, "ops: failed to create %s: %d\n", path_tmp, err);
+        return err;
+    }
+    err = lfs_file_close(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "ops: failed to close %s: %d\n", path_tmp, err);
+        return err;
+    }
+
+    uint8_t *buffer = malloc(14344);
+    if (!buffer) {
+        fprintf(stderr, "ops: out of memory\n");
+        return -1;
+    }
+    fill_random_bytes(buffer, 14344);
+
+    err = lfs_file_open(&sim->lfs, &sim->fdwrite, path_tmp,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        free(buffer);
+        fprintf(stderr, "ops: failed to open %s for write: %d\n", path_tmp, err);
+        return err;
+    }
+
+    lfs_ssize_t written = lfs_file_write(&sim->lfs, &sim->fdwrite, buffer, 14344);
+    free(buffer);
+    if (written < 0 || written != 14344) {
+        int write_err = (written < 0) ? (int)written : -1;
+        lfs_file_close(&sim->lfs, &sim->fdwrite);
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+        fprintf(stderr, "ops: failed to write %s: %d\n", path_tmp, write_err);
+        return write_err;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &sim->fdwrite);
+    if (err) {
+        lfs_file_close(&sim->lfs, &sim->fdwrite);
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+        fprintf(stderr, "ops: failed to sync %s: %d\n", path_tmp, err);
+        return err;
+    }
+
+    sim->fdwrite_open = true;
+    strncpy(sim->fdwrite_path, path_tmp, sizeof(sim->fdwrite_path) - 1);
+    sim->fdwrite_path[sizeof(sim->fdwrite_path) - 1] = '\0';
+
+    err = lfs_remove(&sim->lfs, path_tmp1);
+    if (err) {
+        fprintf(stderr, "ops: failed to remove %s: %d\n", path_tmp1, err);
+        return err;
+    }
+
+    err = lfs_rename(&sim->lfs, path_tmp, path_final);
+    if (err) {
+        fprintf(stderr, "ops: failed to rename %s -> %s: %d\n",
+                path_tmp, path_final, err);
+        return err;
+    }
+
+    strncpy(sim->fdwrite_path, path_final, sizeof(sim->fdwrite_path) - 1);
+    sim->fdwrite_path[sizeof(sim->fdwrite_path) - 1] = '\0';
+    printf("ops completed for %s, fdwrite remains open on %s\n", argv[1], path_final);
+    return 0;
+}
+
 static int cmd_test(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
         fprintf(stderr, "usage: test <count> [output-file]\n");
@@ -3079,6 +3228,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "write") == 0) {
         return cmd_write(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "ops") == 0) {
+        return cmd_ops(sim, argc, argv);
     }
     if (strcmp(argv[0], "mkdir") == 0) {
         return cmd_mkdir(sim, argc, argv);
