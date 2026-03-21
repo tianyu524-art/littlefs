@@ -22,21 +22,31 @@
 #endif
 
 volatile int g_flash_fault_injection_enabled = 0;
+volatile int g_flash_fault_injection_start = 0;
+static volatile int g_flash_fault_worker_started = 0;
 
 #ifdef _WIN32
 static DWORD WINAPI lfs_filebd_fault_worker(LPVOID arg) {
     (void)arg;
-    DWORD delay_ms = 100u + (DWORD)(rand() % 401);
-    Sleep(delay_ms);
-    g_flash_fault_injection_enabled = 1;
+    while (1) {
+        DWORD delay_ms = 100u + (DWORD)(rand() % 401);
+        Sleep(delay_ms);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 1;
+        }
+    }
     return 0;
 }
 #else
 static void *lfs_filebd_fault_worker(void *arg) {
     (void)arg;
-    unsigned delay_ms = 100u + (unsigned)(rand() % 401);
-    usleep(delay_ms * 1000u);
-    g_flash_fault_injection_enabled = 1;
+    while (1) {
+        unsigned delay_ms = 100u + (unsigned)(rand() % 401);
+        usleep(delay_ms * 1000u);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 1;
+        }
+    }
     return NULL;
 }
 #endif
@@ -57,6 +67,7 @@ int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
     lfs_filebd_t *bd = cfg->context;
     bd->cfg = bdcfg;
     g_flash_fault_injection_enabled = 0;
+    g_flash_fault_injection_start = 1;
     srand((unsigned)time(NULL));
 
     // open file
@@ -73,14 +84,20 @@ int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
     }
 
 #ifdef _WIN32
-    HANDLE worker = CreateThread(NULL, 0, lfs_filebd_fault_worker, NULL, 0, NULL);
-    if (worker) {
-        CloseHandle(worker);
+    if (!g_flash_fault_worker_started) {
+        HANDLE worker = CreateThread(NULL, 0, lfs_filebd_fault_worker, NULL, 0, NULL);
+        if (worker) {
+            g_flash_fault_worker_started = 1;
+            CloseHandle(worker);
+        }
     }
 #else
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, lfs_filebd_fault_worker, NULL) == 0) {
-        pthread_detach(worker);
+    if (!g_flash_fault_worker_started) {
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, lfs_filebd_fault_worker, NULL) == 0) {
+            g_flash_fault_worker_started = 1;
+            pthread_detach(worker);
+        }
     }
 #endif
 
@@ -204,6 +221,7 @@ int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
         lfs_size_t fault_offset = (lfs_size_t)(rand() % size);
         fault_buffer[fault_offset] = 0xff;
         write_buffer = fault_buffer;
+        g_flash_fault_injection_enabled = 0;
     }
 
     // program data
