@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -157,6 +158,12 @@ static char *join_args(int argc, char **argv, int start);
 static int split_command(char *line, char **argv, int max_args);
 static char *trim_whitespace(char *text);
 static void fill_random_bytes(uint8_t *buffer, size_t size);
+static int run_internal_command(sim_state_t *sim, const char *fmt, ...);
+static bool is_pwr_data_name(const char *name, uint32_t *index_out);
+static int scan_pwr_files(sim_state_t *sim, const char *path,
+        size_t *count_out, bool *have_any_out, uint32_t *min_index_out,
+        uint32_t *max_index_out);
+static int cmd_test(sim_state_t *sim, int argc, char **argv);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
@@ -349,12 +356,13 @@ static void print_help(void) {
     printf("  cat <file>\n");
     printf("  hexdump <file>\n");
     printf("  create <file>\n");
-    printf("  write <file> <size> [data]\n");
+    printf("  write <file> <size> [data] [--append]\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
     printf("  rename <src> <dst>\n");
     printf("  stat <path>\n");
+    printf("  test <count>\n");
     printf("  tree [path] [--depth N]\n");
     printf("  meta-dump <path> [--block-only] [--parsed-only] [--export [file.txt]]\n");
     printf("  inspect blocks\n");
@@ -1054,6 +1062,104 @@ static void fill_random_bytes(uint8_t *buffer, size_t size) {
     for (size_t i = 0; i < size; i++) {
         buffer[i] = (uint8_t)(rand() & 0xff);
     }
+}
+
+static int run_internal_command(sim_state_t *sim, const char *fmt, ...) {
+    char line[SIM_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    printf("test> %s\n", line);
+
+    char parse_buffer[SIM_LINE_MAX];
+    strncpy(parse_buffer, line, sizeof(parse_buffer) - 1);
+    parse_buffer[sizeof(parse_buffer) - 1] = '\0';
+
+    char *argv[SIM_ARGV_MAX];
+    int argc = split_command(parse_buffer, argv, SIM_ARGV_MAX);
+    bool should_exit = false;
+    int err = dispatch_command(sim, argc, argv, &should_exit);
+    if (should_exit) {
+        return -1;
+    }
+    return err;
+}
+
+static bool is_pwr_data_name(const char *name, uint32_t *index_out) {
+    if (strlen(name) != 12 || strcmp(name + 8, ".PWR") != 0) {
+        return false;
+    }
+
+    uint32_t value = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!isdigit((unsigned char)name[i])) {
+            return false;
+        }
+        value = value * 10u + (uint32_t)(name[i] - '0');
+    }
+
+    if (index_out) {
+        *index_out = value;
+    }
+    return true;
+}
+
+static int scan_pwr_files(sim_state_t *sim, const char *path,
+        size_t *count_out, bool *have_any_out, uint32_t *min_index_out,
+        uint32_t *max_index_out) {
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err) {
+        return err;
+    }
+
+    size_t count = 0;
+    bool have_any = false;
+    uint32_t min_index = 0;
+    uint32_t max_index = 0;
+    struct lfs_info info;
+
+    while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
+        uint32_t index = 0;
+        if (info.type != LFS_TYPE_REG || !is_pwr_data_name(info.name, &index)) {
+            continue;
+        }
+
+        if (!have_any) {
+            have_any = true;
+            min_index = index;
+            max_index = index;
+        } else {
+            if (index < min_index) {
+                min_index = index;
+            }
+            if (index > max_index) {
+                max_index = index;
+            }
+        }
+        count++;
+    }
+
+    lfs_dir_close(&sim->lfs, &dir);
+    if (err < 0) {
+        return err;
+    }
+
+    if (count_out) {
+        *count_out = count;
+    }
+    if (have_any_out) {
+        *have_any_out = have_any;
+    }
+    if (min_index_out) {
+        *min_index_out = min_index;
+    }
+    if (max_index_out) {
+        *max_index_out = max_index;
+    }
+    return 0;
 }
 
 static const char *lschk_status_name(lschk_status_t status) {
@@ -1929,7 +2035,7 @@ static int cmd_create_file(sim_state_t *sim, int argc, char **argv) {
 
 static int cmd_write(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 3) {
-        fprintf(stderr, "usage: write <file> <size> [data]\n");
+        fprintf(stderr, "usage: write <file> <size> [data] [--append]\n");
         return -1;
     }
 
@@ -1945,10 +2051,34 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
         return -1;
     }
 
+    bool append = false;
+    size_t data_argc = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--append") == 0) {
+            append = true;
+        } else {
+            data_argc++;
+        }
+    }
+
     char *data = NULL;
     size_t data_len = 0;
-    if (argc >= 4) {
-        data = join_args(argc, argv, 3);
+    if (data_argc > 0) {
+        char **data_argv = malloc(data_argc * sizeof(*data_argv));
+        if (!data_argv) {
+            fprintf(stderr, "write: out of memory\n");
+            return -1;
+        }
+
+        size_t index = 0;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--append") != 0) {
+                data_argv[index++] = argv[i];
+            }
+        }
+
+        data = join_args((int)data_argc, data_argv, 0);
+        free(data_argv);
         if (!data) {
             fprintf(stderr, "write: out of memory\n");
             return -1;
@@ -1973,7 +2103,7 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
 
     lfs_file_t file;
     int err = lfs_file_open(&sim->lfs, &file, path,
-            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+            LFS_O_WRONLY | LFS_O_CREAT | (append ? LFS_O_APPEND : LFS_O_TRUNC));
     if (err) {
         fprintf(stderr, "write: failed to open %s: %d\n", path, err);
         free(buffer);
@@ -1999,6 +2129,169 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
     }
 
     printf("Wrote %d bytes to %s\n", (int)res, path);
+    return 0;
+}
+
+static int cmd_test(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: test <count>\n");
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "test: invalid count %s\n", argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    const int pwr_chunk_sizes[3] = {600, 625, 650};
+
+    struct lfs_info info;
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            int err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) {
+                return err;
+            }
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            int err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) {
+                return err;
+            }
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            int err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) {
+                return err;
+            }
+        }
+    }
+
+    int err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        return err;
+    }
+
+    for (lfs_size_t iteration = 0; iteration < count; iteration++) {
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+            err = run_internal_command(sim, "create PWR.IDX");
+            if (err) {
+                return err;
+            }
+        } else {
+            err = run_internal_command(sim, "cat PWR.IDX");
+            if (err) {
+                return err;
+            }
+        }
+
+        size_t pwr_count = 0;
+        bool have_any = false;
+        uint32_t min_index = 0;
+        uint32_t max_index = 0;
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "test: failed to scan %s: %d\n", sim->current_path, err);
+            return err;
+        }
+
+        uint32_t next_index = have_any ? (max_index + 1u) : 0u;
+        char new_name[32];
+        snprintf(new_name, sizeof(new_name), "%08"PRIu32".PWR", next_index);
+
+        err = run_internal_command(sim, "create %s", new_name);
+        if (err) {
+            return err;
+        }
+
+        int write_count = 40 + (rand() % 21);
+        for (int i = 0; i < write_count; i++) {
+            int chunk = pwr_chunk_sizes[rand() % 3];
+            err = run_internal_command(sim, "write %s %d --append", new_name, chunk);
+            if (err) {
+                return err;
+            }
+        }
+
+        int idx_append = 800 + (rand() % 201);
+        err = run_internal_command(sim, "write PWR.IDX %d --append", idx_append);
+        if (err) {
+            return err;
+        }
+
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) == 0 &&
+                info.type == LFS_TYPE_REG &&
+                info.size > (30u * 1024u)) {
+            if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
+                err = run_internal_command(sim, "rm PWR.IDX.tmp");
+                if (err) {
+                    return err;
+                }
+            }
+
+            err = run_internal_command(sim, "cp PWR.IDX PWR.IDX.tmp");
+            if (err) {
+                return err;
+            }
+            err = run_internal_command(sim, "rm PWR.IDX");
+            if (err) {
+                return err;
+            }
+            err = run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+            if (err) {
+                return err;
+            }
+        }
+
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "test: failed to scan %s: %d\n", sim->current_path, err);
+            return err;
+        }
+
+        if (pwr_count > 5 && have_any) {
+            char oldest_name[32];
+            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+            err = run_internal_command(sim, "rm %s", oldest_name);
+            if (err) {
+                return err;
+            }
+        }
+
+        err = run_internal_command(sim, "lschk .");
+        if (err) {
+            return err;
+        }
+
+        lschk_entry_t *entries = NULL;
+        size_t entry_count = 0;
+        err = collect_lschk_entries(sim, sim->current_path, &entries, &entry_count);
+        if (err) {
+            fprintf(stderr, "test: lschk scan failed: %d\n", err);
+            return err;
+        }
+
+        bool all_real = true;
+        for (size_t i = 0; i < entry_count; i++) {
+            if (entries[i].status != LSCHK_STATUS_REAL) {
+                all_real = false;
+                break;
+            }
+        }
+        free(entries);
+
+        if (!all_real) {
+            printf("test paused at iteration %"PRIu32": non-real entries detected\n",
+                    (uint32_t)(iteration + 1));
+            return 0;
+        }
+    }
+
+    printf("test completed: %"PRIu32" iterations\n", (uint32_t)count);
     return 0;
 }
 
@@ -2718,6 +3011,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "stat") == 0) {
         return cmd_stat(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "test") == 0) {
+        return cmd_test(sim, argc, argv);
     }
     if (strcmp(argv[0], "mount") == 0) {
         return cmd_mount(sim, argc, argv);
