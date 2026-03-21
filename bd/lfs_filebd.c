@@ -23,7 +23,6 @@
 
 volatile int g_flash_fault_injection_enabled = 0;
 volatile int g_flash_fault_injection_start = 0;
-static volatile int g_flash_fault_worker_started = 0;
 
 #ifdef _WIN32
 static DWORD WINAPI lfs_filebd_fault_worker(LPVOID arg) {
@@ -84,21 +83,16 @@ int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
     }
 
 #ifdef _WIN32
-    if (!g_flash_fault_worker_started) {
         HANDLE worker = CreateThread(NULL, 0, lfs_filebd_fault_worker, NULL, 0, NULL);
         if (worker) {
-            g_flash_fault_worker_started = 1;
             CloseHandle(worker);
         }
-    }
+
 #else
-    if (!g_flash_fault_worker_started) {
         pthread_t worker;
         if (pthread_create(&worker, NULL, lfs_filebd_fault_worker, NULL) == 0) {
-            g_flash_fault_worker_started = 1;
             pthread_detach(worker);
         }
-    }
 #endif
 
     LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", 0);
