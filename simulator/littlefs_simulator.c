@@ -159,6 +159,7 @@ static int sim_open_device(sim_state_t *sim, const char *image_path);
 static int sim_mount(sim_state_t *sim);
 static int sim_unmount(sim_state_t *sim);
 static int sim_format(sim_state_t *sim);
+static int sim_prepare_default_pwd(sim_state_t *sim);
 
 static int resolve_path(
         const sim_state_t *sim, const char *input, char *output, size_t output_size);
@@ -173,6 +174,7 @@ static int scan_pwr_files(sim_state_t *sim, const char *path,
         uint32_t *max_index_out);
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
+static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
@@ -186,6 +188,7 @@ static int cmd_hexdump(sim_state_t *sim, int argc, char **argv);
 static int cmd_create_file(sim_state_t *sim, int argc, char **argv);
 static int cmd_write(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
+static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
 static int cmd_mkdir(sim_state_t *sim, int argc, char **argv);
 static int cmd_rm(sim_state_t *sim, int argc, char **argv);
 static int cmd_cp(sim_state_t *sim, int argc, char **argv);
@@ -370,6 +373,7 @@ static void print_help(void) {
     printf("  create <file>\n");
     printf("  write <file> <size> [data] [--append]\n");
     printf("  ops <name>\n");
+    printf("  renametest <count>\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -908,9 +912,9 @@ static int sim_mount(sim_state_t *sim) {
     }
 
     sim->mounted = true;
-    strcpy(sim->current_path, "/");
+    strcpy(sim->current_path, "/lfs0/LOG/PWR");
     printf("Filesystem mounted.\n");
-    return 0;
+    return sim_prepare_default_pwd(sim);
 }
 
 static int sim_unmount(sim_state_t *sim) {
@@ -968,6 +972,39 @@ static int sim_format(sim_state_t *sim) {
 
     printf("Filesystem formatted.\n");
     return sim_mount(sim);
+}
+
+static int sim_prepare_default_pwd(sim_state_t *sim) {
+    const char *default_path = "/lfs0/LOG/PWR";
+    struct lfs_info info;
+
+    if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+        int err = lfs_mkdir(&sim->lfs, "/lfs0");
+        if (err && err != LFS_ERR_EXIST) {
+            fprintf(stderr, "Failed to create /lfs0: %d\n", err);
+            return err;
+        }
+    }
+
+    if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+        int err = lfs_mkdir(&sim->lfs, "/lfs0/LOG");
+        if (err && err != LFS_ERR_EXIST) {
+            fprintf(stderr, "Failed to create /lfs0/LOG: %d\n", err);
+            return err;
+        }
+    }
+
+    if (lfs_stat(&sim->lfs, default_path, &info) < 0) {
+        int err = lfs_mkdir(&sim->lfs, default_path);
+        if (err && err != LFS_ERR_EXIST) {
+            fprintf(stderr, "Failed to create %s: %d\n", default_path, err);
+            return err;
+        }
+    }
+
+    strncpy(sim->current_path, default_path, sizeof(sim->current_path) - 1);
+    sim->current_path[sizeof(sim->current_path) - 1] = '\0';
+    return 0;
 }
 
 static int resolve_path(
@@ -2313,6 +2350,44 @@ static int cmd_ops(sim_state_t *sim, int argc, char **argv) {
     return 0;
 }
 
+static int cmd_renametest(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: renametest <count>\n");
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "renametest: invalid count %s\n", argv[1]);
+        return -1;
+    }
+
+    int err = run_internal_command(sim, "create aaaaa");
+    if (err) {
+        return err;
+    }
+
+    err = run_internal_command(sim, "create bbbbb");
+    if (err) {
+        return err;
+    }
+
+    for (lfs_size_t i = 0; i < count; i++) {
+        err = run_internal_command(sim, "rename aaaaa bbbbb");
+        if (err) {
+            return err;
+        }
+
+        err = run_internal_command(sim, "rename bbbbb aaaaa");
+        if (err) {
+            return err;
+        }
+    }
+
+    printf("renametest completed: %"PRIu32" iterations\n", (uint32_t)count);
+    return 0;
+}
+
 static int cmd_test(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
         fprintf(stderr, "usage: test <count> [output-file]\n");
@@ -3231,6 +3306,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "ops") == 0) {
         return cmd_ops(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "renametest") == 0) {
+        return cmd_renametest(sim, argc, argv);
     }
     if (strcmp(argv[0], "mkdir") == 0) {
         return cmd_mkdir(sim, argc, argv);
