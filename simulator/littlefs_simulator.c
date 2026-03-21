@@ -2456,7 +2456,6 @@ static int cmd_faulttest(sim_state_t *sim, int argc, char **argv) {
         printf("faulttest log path: %s\n", output_path);
     }
 
-    g_flash_fault_injection_start = 1;
 
     if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
         if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
@@ -2507,16 +2506,16 @@ static int cmd_faulttest(sim_state_t *sim, int argc, char **argv) {
         uint32_t next_index = have_any ? (max_index + 1u) : 0u;
         char new_name[32];
         snprintf(new_name, sizeof(new_name), "%08"PRIu32".PWR", next_index);
-
+        g_flash_fault_injection_start = 1;
         err = run_internal_command(sim, "create %s", new_name);
         if (err) {
             goto cleanup;
         }
+        g_flash_fault_injection_start = 0;
 
         int write_count = 10 + (rand() % 11);
         for (int i = 0; i < write_count; i++) {
             int chunk = (3 + (rand() % 7)) * 1024;
-            g_flash_fault_injection_start = ((i % 2) == 0) ? 1 : 0;
             for (int repeat = 0; repeat < 2; repeat++) {
                 err = run_internal_command(sim, "write %s %d --append", new_name, chunk);
                 if (err) {
@@ -2530,16 +2529,14 @@ static int cmd_faulttest(sim_state_t *sim, int argc, char **argv) {
             }
         }
 
-        g_flash_fault_injection_start = 1;
         err = run_internal_command(sim, "write PWR.IDX %d --append", 800 + (rand() % 201));
         if (err) {
             goto cleanup;
         }
-
         if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) == 0 &&
                 info.type == LFS_TYPE_REG &&
                 info.size > (30u * 1024u)) {
-            g_flash_fault_injection_start = 0;
+           
             if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
                 err = run_internal_command(sim, "rm PWR.IDX.tmp");
                 if (err) {
@@ -2551,16 +2548,18 @@ static int cmd_faulttest(sim_state_t *sim, int argc, char **argv) {
             if (err) {
                 goto cleanup;
             }
+            g_flash_fault_injection_start = 1;
             err = run_internal_command(sim, "rm PWR.IDX");
             if (err) {
                 goto cleanup;
             }
             err = run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+            g_flash_fault_injection_start = 0;
             if (err) {
                 goto cleanup;
             }
         }
-
+        g_flash_fault_injection_start = 0;
         err = run_internal_command(sim, "lschk .");
         if (err) {
             goto cleanup;
