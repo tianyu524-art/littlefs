@@ -40,7 +40,7 @@ static DWORD WINAPI lfs_filebd_fault_worker(LPVOID arg) {
 static void *lfs_filebd_fault_worker(void *arg) {
     (void)arg;
     while (1) {
-        unsigned delay_ms = 500u + (unsigned)(rand() % 401);
+        unsigned delay_ms = 100u + (unsigned)(rand() % 401);
         usleep(delay_ms * 1000u);
         if (g_flash_fault_injection_start == 1) {
             g_flash_fault_injection_enabled = 1;
@@ -216,6 +216,7 @@ int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
         fault_buffer[fault_offset] = rand() % 0xff;
         write_buffer = fault_buffer;
         g_flash_fault_injection_enabled = 0;
+        printf("\n***#####flash error#####***\n");
     }
 
     // program data
