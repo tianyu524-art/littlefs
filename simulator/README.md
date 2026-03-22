@@ -1,7 +1,8 @@
 # littlefs Simulator
 
 `littlefs_simulator` is a Windows/Linux command-line simulator that runs the
-real `littlefs` sources on top of a file-backed block device.
+real `littlefs` sources on top of a RAM-backed block device loaded from an
+image file.
 
 It is intended for:
 
@@ -24,7 +25,7 @@ Implemented:
 - block inspection commands
 - metadata pair dump and export
 - recursive tree printing with optional depth limit
-- file-backed flash erase behavior using `0xFF`
+- RAM-backed flash erase behavior using `0xFF`
 
 Not implemented in the current simulator:
 
@@ -61,7 +62,7 @@ Example with GCC:
 ```bash
 gcc -I. -I./bd -std=c99 -Wall -Wextra -pedantic \
     -o simulator/littlefs_simulator.exe \
-    lfs.c lfs_util.c bd/lfs_filebd.c simulator/littlefs_simulator.c
+    lfs.c lfs_util.c bd/lfs_rambd.c simulator/littlefs_simulator.c
 ```
 
 ## Top-level commands
@@ -92,10 +93,12 @@ simulator/littlefs_simulator.exe open text.img --block-size 131072
 Behavior:
 
 - loads `*.cfg` if present
+- loads the image contents into RAM before mounting
 - applies command-line overrides
 - auto-adjusts geometry when possible for existing images
 - attempts to mount immediately
 - if mount fails, keeps the device open and enters the shell unmounted
+- writes the RAM-backed device back to the image on exit
 
 Important:
 

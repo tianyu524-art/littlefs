@@ -2,7 +2,7 @@
  * littlefs simulator
  *
  * A simple Windows/Linux command-line simulator that runs the real littlefs
- * sources against a file-backed block device.
+ * sources against a RAM-backed block device loaded from an image file.
  */
 
 #include <ctype.h>
@@ -30,11 +30,11 @@
 #include <unistd.h>
 #endif
 
-#include "bd/lfs_filebd.h"
+#include "bd/lfs_rambd.h"
 #include "lfs.h"
 #include "lfs_util.h"
 
-extern volatile int g_flash_fault_injection_start;
+volatile int g_flash_fault_injection_start = 0;
 
 #define SIM_PATH_MAX 1024
 #define SIM_LINE_MAX 4096
@@ -78,8 +78,8 @@ typedef struct cli_options {
 
 typedef struct sim_state {
     sim_storage_cfg_t storage;
-    lfs_filebd_t bd;
-    struct lfs_filebd_config bd_cfg;
+    lfs_rambd_t bd;
+    struct lfs_rambd_config bd_cfg;
     struct lfs_config cfg;
     lfs_t lfs;
 
@@ -158,6 +158,8 @@ static int file_exists(const char *path);
 static void sim_state_init(sim_state_t *sim);
 static void sim_state_deinit(sim_state_t *sim);
 static int sim_open_device(sim_state_t *sim, const char *image_path);
+static int load_image_into_device(sim_state_t *sim, const char *image_path);
+static int flush_device_to_image(const sim_state_t *sim);
 static int sim_mount(sim_state_t *sim);
 static int sim_unmount(sim_state_t *sim);
 static int sim_format(sim_state_t *sim);
@@ -847,7 +849,10 @@ static void sim_state_deinit(sim_state_t *sim) {
     }
 
     if (sim->device_open) {
-        lfs_filebd_destroy(&sim->cfg);
+        if (flush_device_to_image(sim)) {
+            fprintf(stderr, "Failed to flush image %s\n", sim->image_path);
+        }
+        lfs_rambd_destroy(&sim->cfg);
         sim->device_open = false;
     }
 
@@ -874,10 +879,10 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->bd_cfg.erase_value = 0xff;
 
     sim->cfg.context = &sim->bd;
-    sim->cfg.read = lfs_filebd_read;
-    sim->cfg.prog = lfs_filebd_prog;
-    sim->cfg.erase = lfs_filebd_erase;
-    sim->cfg.sync = lfs_filebd_sync;
+    sim->cfg.read = lfs_rambd_read;
+    sim->cfg.prog = lfs_rambd_prog;
+    sim->cfg.erase = lfs_rambd_erase;
+    sim->cfg.sync = lfs_rambd_sync;
     sim->cfg.read_size = sim->storage.read_size;
     sim->cfg.prog_size = sim->storage.prog_size;
     sim->cfg.block_size = sim->storage.block_size;
@@ -893,14 +898,75 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->cfg.attr_max = LFS_ATTR_MAX;
     sim->cfg.metadata_max = sim->storage.block_size;
 
-    int err = lfs_filebd_createcfg(&sim->cfg, image_path, &sim->bd_cfg);
+    int err = lfs_rambd_createcfg(&sim->cfg, &sim->bd_cfg);
     if (err) {
-        fprintf(stderr, "Failed to open block device %s: %d\n", image_path, err);
+        fprintf(stderr, "Failed to create RAM block device for %s: %d\n",
+                image_path, err);
         return -1;
     }
 
     strncpy(sim->image_path, image_path, sizeof(sim->image_path)-1);
+    sim->image_path[sizeof(sim->image_path)-1] = '\0';
+    err = load_image_into_device(sim, image_path);
+    if (err) {
+        lfs_rambd_destroy(&sim->cfg);
+        return -1;
+    }
+
     sim->device_open = true;
+    return 0;
+}
+
+static int load_image_into_device(sim_state_t *sim, const char *image_path) {
+    FILE *f = fopen(image_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open image %s: %s\n",
+                image_path, strerror(errno));
+        return -1;
+    }
+
+    size_t total = (size_t)sim->storage.block_size * sim->storage.block_count;
+    size_t read_size = fread(sim->bd.buffer, 1, total, f);
+    if (read_size != total) {
+        if (ferror(f)) {
+            fprintf(stderr, "Failed to read image %s: %s\n",
+                    image_path, strerror(errno));
+        } else {
+            fprintf(stderr, "Short read while loading image %s\n", image_path);
+        }
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int flush_device_to_image(const sim_state_t *sim) {
+    FILE *f = fopen(sim->image_path, "r+b");
+    if (!f) {
+        fprintf(stderr, "Failed to open image %s for writeback: %s\n",
+                sim->image_path, strerror(errno));
+        return -1;
+    }
+
+    size_t total = (size_t)sim->storage.block_size * sim->storage.block_count;
+    size_t write_size = fwrite(sim->bd.buffer, 1, total, f);
+    if (write_size != total) {
+        fprintf(stderr, "Failed to write image %s: %s\n",
+                sim->image_path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+
+    if (fflush(f) != 0) {
+        fprintf(stderr, "Failed to flush image %s: %s\n",
+                sim->image_path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
     return 0;
 }
 
@@ -1750,34 +1816,13 @@ static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer,
 
 static int read_device_bytes(
         sim_state_t *sim, uint64_t offset, void *buffer, size_t size) {
-    uint8_t *cursor = buffer;
-    size_t remaining = size;
-
-    off_t pos = lseek(sim->bd.fd, (off_t)offset, SEEK_SET);
-    if (pos < 0) {
-        int err = -errno;
-        fprintf(stderr, "device read seek failed at 0x%"PRIx64": %d\n",
-                offset, err);
-        return err;
+    uint64_t total = (uint64_t)sim->storage.block_size * sim->storage.block_count;
+    if (offset > total || size > total - offset) {
+        fprintf(stderr, "device read out of range at 0x%"PRIx64"\n", offset);
+        return -1;
     }
 
-    while (remaining > 0) {
-        ssize_t res = read(sim->bd.fd, cursor, remaining);
-        if (res < 0) {
-            int err = -errno;
-            fprintf(stderr, "device read failed at 0x%"PRIx64": %d\n",
-                    offset + (uint64_t)(cursor - (uint8_t*)buffer), err);
-            return err;
-        }
-        if (res == 0) {
-            memset(cursor, 0xff, remaining);
-            break;
-        }
-
-        cursor += res;
-        remaining -= (size_t)res;
-    }
-
+    memcpy(buffer, &sim->bd.buffer[offset], size);
     return 0;
 }
 
