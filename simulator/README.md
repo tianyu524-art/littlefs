@@ -130,6 +130,7 @@ simulator/littlefs_simulator.exe run test.lfs --image test.bin --stop-on-error
 - `cp <src> <dst>`
 - `rename <src> <dst>`
 - `stat <path>`
+- `issue1177 [attempts]`
 - `format`
 - `mount`
 - `umount`
@@ -142,6 +143,21 @@ simulator/littlefs_simulator.exe run test.lfs --image test.bin --stop-on-error
 - `inspect blocks`
 - `inspect block <N>`
 - `meta-dump <path> [--block-only] [--parsed-only] [--export [file.txt]]`
+
+### Issue reproduction
+
+`issue1177 [attempts]` runs a destructive reproduction pass for the
+multiple-write-handle stale-file scenario discussed around issue `#1177`.
+It reformats the currently opened image, then tries several parameter sets
+that:
+
+- keep one write handle open after `sync`
+- truncate the same file through a second write handle
+- force another file to reuse released space
+- write again through the stale first handle
+
+If the second file's contents change unexpectedly, the command reports that
+the issue was reproduced.
 
 ## Examples
 

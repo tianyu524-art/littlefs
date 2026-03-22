@@ -180,6 +180,7 @@ static int cmd_test(sim_state_t *sim, int argc, char **argv);
 static int cmd_faulttest(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
+static int cmd_issue1177(sim_state_t *sim, int argc, char **argv);
 
 static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
@@ -234,6 +235,13 @@ static bool buffer_is_erased(const uint8_t *buffer, size_t size);
 static bool meta_type_is_crc(uint16_t type);
 static const char *lschk_status_name(lschk_status_t status);
 static bool pair_equals(const lfs_block_t a[2], const lfs_block_t b[2]);
+static void fill_pattern_bytes(uint8_t *buffer, size_t size, uint8_t seed);
+static int write_file_exact(lfs_t *lfs, const char *path,
+        const uint8_t *buffer, lfs_size_t size, int flags);
+static int issue1177_fill_pad(
+        sim_state_t *sim, const char *path, lfs_size_t target_free_blocks);
+static int issue1177_run_attempt(sim_state_t *sim, int attempt,
+        bool *reproduced_out, int *mismatch_offset_out);
 static int build_child_path(
         const char *dir_path, const char *name, char *buffer, size_t buffer_size);
 static int collect_lschk_entries(
@@ -379,6 +387,7 @@ static void print_help(void) {
     printf("  create <file>\n");
     printf("  write <file> <size> [data] [--append]\n");
     printf("  ops <name>\n");
+    printf("  issue1177 [attempts]\n");
     printf("  renametest <count>\n");
     printf("  faulttest <count> [output-file]\n");
     printf("  mkdir <dir>\n");
@@ -2297,6 +2306,283 @@ static int cmd_write(sim_state_t *sim, int argc, char **argv) {
     return 0;
 }
 
+static void fill_pattern_bytes(uint8_t *buffer, size_t size, uint8_t seed) {
+    for (size_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)(seed + ((i * 29u) & 0x7fu));
+    }
+}
+
+static int write_file_exact(lfs_t *lfs, const char *path,
+        const uint8_t *buffer, lfs_size_t size, int flags) {
+    lfs_file_t file;
+    int err = lfs_file_open(lfs, &file, path, flags);
+    if (err) {
+        return err;
+    }
+
+    lfs_ssize_t written = lfs_file_write(lfs, &file, buffer, size);
+    if (written < 0 || (lfs_size_t)written != size) {
+        int write_err = (written < 0) ? (int)written : -1;
+        lfs_file_close(lfs, &file);
+        return write_err;
+    }
+
+    err = lfs_file_close(lfs, &file);
+    if (err) {
+        return err;
+    }
+
+    return 0;
+}
+
+static int issue1177_fill_pad(
+        sim_state_t *sim, const char *path, lfs_size_t target_free_blocks) {
+    lfs_size_t chunk_size = sim->storage.block_size;
+    uint8_t *chunk = malloc(chunk_size);
+    if (!chunk) {
+        return LFS_ERR_NOMEM;
+    }
+    fill_pattern_bytes(chunk, chunk_size, 0x31);
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        free(chunk);
+        return err;
+    }
+
+    while (true) {
+        lfs_ssize_t used = lfs_fs_size(&sim->lfs);
+        if (used < 0) {
+            err = (int)used;
+            break;
+        }
+
+        lfs_size_t free_blocks = (used <= (lfs_ssize_t)sim->storage.block_count)
+                ? (sim->storage.block_count - (lfs_size_t)used)
+                : 0;
+        if (free_blocks <= target_free_blocks) {
+            err = 0;
+            break;
+        }
+
+        lfs_ssize_t written = lfs_file_write(&sim->lfs, &file, chunk, chunk_size);
+        if (written < 0 || (lfs_size_t)written != chunk_size) {
+            err = (written < 0) ? (int)written : -1;
+            break;
+        }
+
+        err = lfs_file_sync(&sim->lfs, &file);
+        if (err) {
+            break;
+        }
+    }
+
+    int close_err = lfs_file_close(&sim->lfs, &file);
+    free(chunk);
+    if (err) {
+        return err;
+    }
+    return close_err;
+}
+
+static int issue1177_run_attempt(sim_state_t *sim, int attempt,
+        bool *reproduced_out, int *mismatch_offset_out) {
+    static const char *root = "/issue1177";
+    static const char *victim = "/issue1177/e.bin";
+    static const char *pad = "/issue1177/pad.bin";
+    static const char *filler = "/issue1177/f.bin";
+
+    *reproduced_out = false;
+    *mismatch_offset_out = -1;
+
+    int err = sim_format(sim);
+    if (err) {
+        return err;
+    }
+
+    err = lfs_mkdir(&sim->lfs, root);
+    if (err && err != LFS_ERR_EXIST) {
+        return err;
+    }
+
+    lfs_size_t old_size = ((attempt % 2) + 1) * sim->storage.block_size
+            + sim->storage.prog_size * 8u;
+    lfs_size_t truncate_size = sim->storage.prog_size;
+    lfs_size_t stale_write_size = sim->storage.prog_size * 8u;
+    if (stale_write_size > old_size) {
+        stale_write_size = old_size;
+    }
+    if (stale_write_size == 0) {
+        stale_write_size = sim->storage.prog_size;
+    }
+
+    lfs_size_t old_blocks =
+            (old_size + sim->storage.block_size - 1) / sim->storage.block_size;
+    lfs_size_t target_free_blocks = old_blocks + 3u;
+    if (attempt >= 2) {
+        lfs_size_t reduce = (lfs_size_t)(attempt - 1);
+        target_free_blocks = (target_free_blocks > reduce)
+                ? (target_free_blocks - reduce) : 1u;
+    }
+
+    uint8_t *old_data = malloc(old_size);
+    uint8_t *filler_data = malloc(old_size);
+    uint8_t *stale_data = malloc(stale_write_size);
+    if (!old_data || !filler_data || !stale_data) {
+        free(old_data);
+        free(filler_data);
+        free(stale_data);
+        return LFS_ERR_NOMEM;
+    }
+
+    fill_pattern_bytes(old_data, old_size, (uint8_t)(0x40 + attempt));
+    fill_pattern_bytes(filler_data, old_size, (uint8_t)(0x90 + attempt));
+    fill_pattern_bytes(stale_data, stale_write_size, (uint8_t)(0xe0 + attempt));
+
+    lfs_file_t handle_a;
+    lfs_file_t handle_b;
+    bool handle_a_open = false;
+    bool handle_b_open = false;
+
+    err = lfs_file_open(&sim->lfs, &handle_a, victim,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        goto cleanup;
+    }
+    handle_a_open = true;
+
+    lfs_ssize_t written = lfs_file_write(&sim->lfs, &handle_a, old_data, old_size);
+    if (written < 0 || (lfs_size_t)written != old_size) {
+        err = (written < 0) ? (int)written : -1;
+        goto cleanup;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &handle_a);
+    if (err) {
+        goto cleanup;
+    }
+
+    err = issue1177_fill_pad(sim, pad, target_free_blocks);
+    if (err) {
+        goto cleanup;
+    }
+
+    err = lfs_file_open(&sim->lfs, &handle_b, victim, LFS_O_WRONLY);
+    if (err) {
+        goto cleanup;
+    }
+    handle_b_open = true;
+
+    err = lfs_file_truncate(&sim->lfs, &handle_b, truncate_size);
+    if (err) {
+        goto cleanup;
+    }
+
+    err = lfs_file_close(&sim->lfs, &handle_b);
+    handle_b_open = false;
+    if (err) {
+        goto cleanup;
+    }
+
+    err = write_file_exact(&sim->lfs, filler, filler_data, old_size,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        goto cleanup;
+    }
+
+    lfs_soff_t seek_res = lfs_file_seek(&sim->lfs, &handle_a,
+            (lfs_soff_t)(old_size - stale_write_size), LFS_SEEK_SET);
+    if (seek_res < 0) {
+        err = (int)seek_res;
+        goto cleanup;
+    }
+
+    written = lfs_file_write(&sim->lfs, &handle_a, stale_data, stale_write_size);
+    if (written < 0 || (lfs_size_t)written != stale_write_size) {
+        err = (written < 0) ? (int)written : -1;
+        goto cleanup;
+    }
+
+    err = lfs_file_close(&sim->lfs, &handle_a);
+    handle_a_open = false;
+    if (err) {
+        goto cleanup;
+    }
+
+    uint8_t *actual = NULL;
+    lfs_size_t actual_size = 0;
+    err = read_file_alloc(sim, filler, &actual, &actual_size);
+    if (err) {
+        goto cleanup;
+    }
+
+    if (actual_size != old_size) {
+        *reproduced_out = true;
+        *mismatch_offset_out = -2;
+    } else if (memcmp(actual, filler_data, old_size) != 0) {
+        *reproduced_out = true;
+        for (lfs_size_t i = 0; i < old_size; i++) {
+            if (actual[i] != filler_data[i]) {
+                *mismatch_offset_out = (int)i;
+                break;
+            }
+        }
+    }
+
+    free(actual);
+    err = 0;
+
+cleanup:
+    if (handle_b_open) {
+        lfs_file_close(&sim->lfs, &handle_b);
+    }
+    if (handle_a_open) {
+        lfs_file_close(&sim->lfs, &handle_a);
+    }
+    free(old_data);
+    free(filler_data);
+    free(stale_data);
+    return err;
+}
+
+static int cmd_issue1177(sim_state_t *sim, int argc, char **argv) {
+    lfs_size_t attempts = 8;
+    if (argc >= 2) {
+        if (parse_size_arg(argv[1], &attempts) || attempts == 0) {
+            fprintf(stderr, "usage: issue1177 [attempts]\n");
+            return -1;
+        }
+    }
+
+    printf("issue1177: formatting current image before reproduction attempts\n");
+    for (lfs_size_t i = 0; i < attempts; i++) {
+        bool reproduced = false;
+        int mismatch_offset = -1;
+        int err = issue1177_run_attempt(sim, (int)i, &reproduced, &mismatch_offset);
+        if (err) {
+            printf("issue1177 attempt %"PRIu32": setup failed with %d\n",
+                    (uint32_t)(i + 1), err);
+            continue;
+        }
+
+        if (reproduced) {
+            printf("issue1177 reproduced on attempt %"PRIu32
+                    " (filler mismatch offset %d)\n",
+                    (uint32_t)(i + 1), mismatch_offset);
+            return 0;
+        }
+
+        printf("issue1177 attempt %"PRIu32": no corruption observed\n",
+                (uint32_t)(i + 1));
+    }
+
+    printf("issue1177 not reproduced after %"PRIu32" attempts\n",
+            (uint32_t)attempts);
+    return 0;
+}
+
 static int cmd_ops(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
         fprintf(stderr, "usage: ops <name>\n");
@@ -3592,6 +3878,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "ops") == 0) {
         return cmd_ops(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "issue1177") == 0) {
+        return cmd_issue1177(sim, argc, argv);
     }
     if (strcmp(argv[0], "renametest") == 0) {
         return cmd_renametest(sim, argc, argv);
