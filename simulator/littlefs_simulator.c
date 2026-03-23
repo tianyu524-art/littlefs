@@ -2,7 +2,7 @@
  * littlefs simulator
  *
  * A simple Windows/Linux command-line simulator that runs the real littlefs
- * sources against a file-backed block device.
+ * sources against a RAM-backed block device with image-file persistence.
  */
 
 #include <ctype.h>
@@ -30,23 +30,23 @@
 #include <unistd.h>
 #endif
 
-#include "bd/lfs_filebd.h"
+#include "bd/lfs_rambd.h"
 #include "lfs.h"
 #include "lfs_util.h"
 
 extern volatile int g_flash_fault_injection_start;
-
+extern volatile int g_flash_fault_injection_enabled;
 #define SIM_PATH_MAX 1024
 #define SIM_LINE_MAX 4096
 #define SIM_ARGV_MAX 64
 #define SIM_READ_CHUNK 4096
 
-#define DEFAULT_BLOCK_SIZE      (256u * 1024u)
-#define DEFAULT_BLOCK_COUNT     416u
+#define DEFAULT_BLOCK_SIZE      (1u * 1024u)
+#define DEFAULT_BLOCK_COUNT     256u
 #define DEFAULT_READ_SIZE       16u
 #define DEFAULT_PROG_SIZE       16u
 #define DEFAULT_CACHE_SIZE      256u
-#define DEFAULT_LOOKAHEAD_SIZE  16u
+#define DEFAULT_LOOKAHEAD_SIZE  32u
 #define DEFAULT_BLOCK_CYCLES    500
 
 typedef struct sim_storage_cfg {
@@ -78,8 +78,8 @@ typedef struct cli_options {
 
 typedef struct sim_state {
     sim_storage_cfg_t storage;
-    lfs_filebd_t bd;
-    struct lfs_filebd_config bd_cfg;
+    lfs_rambd_t bd;
+    struct lfs_rambd_config bd_cfg;
     struct lfs_config cfg;
     lfs_t lfs;
 
@@ -154,6 +154,8 @@ static int infer_geometry_from_image(
 static int validate_image_size(
         const char *image_path, const sim_storage_cfg_t *storage);
 static int file_exists(const char *path);
+static int load_image_into_device(sim_state_t *sim, const char *image_path);
+static int flush_device_to_image(sim_state_t *sim);
 
 static void sim_state_init(sim_state_t *sim);
 static void sim_state_deinit(sim_state_t *sim);
@@ -168,14 +170,19 @@ static int resolve_path(
 static char *join_args(int argc, char **argv, int start);
 static int split_command(char *line, char **argv, int max_args);
 static char *trim_whitespace(char *text);
+static void sleep_ms(unsigned ms);
 static void fill_random_bytes(uint8_t *buffer, size_t size);
 static int run_internal_command(sim_state_t *sim, const char *fmt, ...);
 static bool is_pwr_data_name(const char *name, uint32_t *index_out);
 static int scan_pwr_files(sim_state_t *sim, const char *path,
         size_t *count_out, bool *have_any_out, uint32_t *min_index_out,
         uint32_t *max_index_out);
+static int find_visible_stat_failure(sim_state_t *sim, const char *path,
+        char *name_out, size_t name_out_size, int *stat_err_out);
+static int inject_deleted_handle_write(sim_state_t *sim, const char *base_name);
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
 static int cmd_faulttest(sim_state_t *sim, int argc, char **argv);
+static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
 
@@ -183,6 +190,7 @@ static int cmd_help(sim_state_t *sim, int argc, char **argv);
 static int cmd_ls(sim_state_t *sim, int argc, char **argv);
 static int cmd_lschk(sim_state_t *sim, int argc, char **argv);
 static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv);
+static int cmd_lsrepair2(sim_state_t *sim, int argc, char **argv);
 static int cmd_cd(sim_state_t *sim, int argc, char **argv);
 static int cmd_pwd(sim_state_t *sim, int argc, char **argv);
 static int cmd_read(sim_state_t *sim, int argc, char **argv);
@@ -369,6 +377,7 @@ static void print_help(void) {
     printf("  ls [path]\n");
     printf("  lschk [path]\n");
     printf("  lsrepair [path] [--damaged]\n");
+    printf("  lsrepair2 [path]\n");
     printf("  cd <path>\n");
     printf("  pwd\n");
     printf("  read <file>\n");
@@ -379,6 +388,7 @@ static void print_help(void) {
     printf("  ops <name>\n");
     printf("  renametest <count>\n");
     printf("  faulttest <count> [output-file]\n");
+    printf("  statfailtest <count> [output-file]\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -828,6 +838,67 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+static int load_image_into_device(sim_state_t *sim, const char *image_path) {
+    uint64_t image_size = 0;
+    int err = image_file_size(image_path, &image_size);
+    if (err) {
+        return err;
+    }
+
+    uint64_t expected = (uint64_t)sim->storage.block_size * sim->storage.block_count;
+    if (image_size != expected) {
+        fprintf(stderr,
+                "Image size mismatch for %s: expected %"PRIu64", got %"PRIu64"\n",
+                image_path, expected, image_size);
+        return -1;
+    }
+
+    FILE *f = fopen(image_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open image %s: %s\n",
+                image_path, strerror(errno));
+        return -1;
+    }
+
+    size_t total = (size_t)expected;
+    size_t read_count = fread(sim->bd.buffer, 1, total, f);
+    if (read_count != total) {
+        fclose(f);
+        fprintf(stderr, "Failed to load image %s: %s\n",
+                image_path, ferror(f) ? strerror(errno) : "unexpected EOF");
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int flush_device_to_image(sim_state_t *sim) {
+    if (!sim->device_open || sim->bd.buffer == NULL || sim->image_path[0] == '\0') {
+        return 0;
+    }
+
+    uint64_t total64 = (uint64_t)sim->storage.block_size * sim->storage.block_count;
+    size_t total = (size_t)total64;
+    FILE *f = fopen(sim->image_path, "wb");
+    if (!f) {
+        fprintf(stderr, "Failed to flush image %s: %s\n",
+                sim->image_path, strerror(errno));
+        return -1;
+    }
+
+    size_t written = fwrite(sim->bd.buffer, 1, total, f);
+    if (written != total || fflush(f) != 0) {
+        fclose(f);
+        fprintf(stderr, "Failed to flush image %s: %s\n",
+                sim->image_path, strerror(errno));
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
 static void sim_state_init(sim_state_t *sim) {
     memset(sim, 0, sizeof(*sim));
     strcpy(sim->current_path, "/");
@@ -847,7 +918,11 @@ static void sim_state_deinit(sim_state_t *sim) {
     }
 
     if (sim->device_open) {
-        lfs_filebd_destroy(&sim->cfg);
+        if (flush_device_to_image(sim) != 0) {
+            fprintf(stderr, "Warning: failed to flush image %s during shutdown\n",
+                    sim->image_path);
+        }
+        lfs_rambd_destroy(&sim->cfg);
         sim->device_open = false;
     }
 
@@ -874,10 +949,10 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->bd_cfg.erase_value = 0xff;
 
     sim->cfg.context = &sim->bd;
-    sim->cfg.read = lfs_filebd_read;
-    sim->cfg.prog = lfs_filebd_prog;
-    sim->cfg.erase = lfs_filebd_erase;
-    sim->cfg.sync = lfs_filebd_sync;
+    sim->cfg.read = lfs_rambd_read;
+    sim->cfg.prog = lfs_rambd_prog;
+    sim->cfg.erase = lfs_rambd_erase;
+    sim->cfg.sync = lfs_rambd_sync;
     sim->cfg.read_size = sim->storage.read_size;
     sim->cfg.prog_size = sim->storage.prog_size;
     sim->cfg.block_size = sim->storage.block_size;
@@ -893,13 +968,21 @@ static int sim_open_device(sim_state_t *sim, const char *image_path) {
     sim->cfg.attr_max = LFS_ATTR_MAX;
     sim->cfg.metadata_max = sim->storage.block_size;
 
-    int err = lfs_filebd_createcfg(&sim->cfg, image_path, &sim->bd_cfg);
+    int err = lfs_rambd_createcfg(&sim->cfg, &sim->bd_cfg);
     if (err) {
-        fprintf(stderr, "Failed to open block device %s: %d\n", image_path, err);
+        fprintf(stderr, "Failed to create RAM block device for %s: %d\n",
+                image_path, err);
         return -1;
     }
 
     strncpy(sim->image_path, image_path, sizeof(sim->image_path)-1);
+    err = load_image_into_device(sim, image_path);
+    if (err) {
+        lfs_rambd_destroy(&sim->cfg);
+        sim->image_path[0] = '\0';
+        return -1;
+    }
+
     sim->device_open = true;
     return 0;
 }
@@ -945,6 +1028,10 @@ static int sim_unmount(sim_state_t *sim) {
     }
 
     sim->mounted = false;
+    err = flush_device_to_image(sim);
+    if (err) {
+        return err;
+    }
     printf("Filesystem unmounted.\n");
     return 0;
 }
@@ -1140,6 +1227,14 @@ static char *trim_whitespace(char *text) {
     return text;
 }
 
+static void sleep_ms(unsigned ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
 static void fill_random_bytes(uint8_t *buffer, size_t size) {
     for (size_t i = 0; i < size; i++) {
         buffer[i] = (uint8_t)(rand() & 0xff);
@@ -1241,6 +1336,116 @@ static int scan_pwr_files(sim_state_t *sim, const char *path,
     if (max_index_out) {
         *max_index_out = max_index;
     }
+    return 0;
+}
+
+static int find_visible_stat_failure(sim_state_t *sim, const char *path,
+        char *name_out, size_t name_out_size, int *stat_err_out) {
+    lfs_dir_t dir;
+    int err = lfs_dir_open(&sim->lfs, &dir, path);
+    if (err) {
+        return err;
+    }
+
+    struct lfs_info info;
+    while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        char child_path[SIM_PATH_MAX];
+        if (build_child_path(path, info.name, child_path, sizeof(child_path))) {
+            lfs_dir_close(&sim->lfs, &dir);
+            return -1;
+        }
+
+        struct lfs_info stat_info;
+        int stat_err = lfs_stat(&sim->lfs, child_path, &stat_info);
+        if (stat_err) {
+            strncpy(name_out, info.name, name_out_size - 1);
+            name_out[name_out_size - 1] = '\0';
+            if (stat_err_out) {
+                *stat_err_out = stat_err;
+            }
+            lfs_dir_close(&sim->lfs, &dir);
+            return 1;
+        }
+    }
+
+    lfs_dir_close(&sim->lfs, &dir);
+    if (err < 0) {
+        return err;
+    }
+    return 0;
+}
+
+static int inject_deleted_handle_write(sim_state_t *sim, const char *base_name) {
+    int saved_start = g_flash_fault_injection_start;
+    int saved_enabled = g_flash_fault_injection_enabled;
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+
+    int err = run_internal_command(sim, "ops %s", base_name);
+    if (err) {
+        fprintf(stderr, "statfailtest: ops %s failed: %d\n", base_name, err);
+        g_flash_fault_injection_start = saved_start;
+        g_flash_fault_injection_enabled = saved_enabled;
+        return 0;
+    }
+
+    char rel_final[SIM_PATH_MAX];
+    snprintf(rel_final, sizeof(rel_final), "%s.PWR", base_name);
+    err = run_internal_command(sim, "rm %s", rel_final);
+    if (err) {
+        fprintf(stderr, "statfailtest: rm %s failed: %d\n", rel_final, err);
+        if (sim->fdwrite_open) {
+            lfs_file_close(&sim->lfs, &sim->fdwrite);
+            sim->fdwrite_open = false;
+            sim->fdwrite_path[0] = '\0';
+        }
+        g_flash_fault_injection_start = saved_start;
+        g_flash_fault_injection_enabled = saved_enabled;
+        return 0;
+    }
+
+    if (sim->fdwrite_open) {
+        int writes = 1 + (rand() % 3);
+        for (int i = 0; i < writes; i++) {
+            lfs_size_t size = 1024u * (lfs_size_t)(1 + (rand() % 3));
+            uint8_t *buffer = malloc(size);
+            if (!buffer) {
+                fprintf(stderr, "statfailtest: out of memory during stale write\n");
+                break;
+            }
+
+            fill_random_bytes(buffer, size);
+            lfs_ssize_t written = lfs_file_write(&sim->lfs, &sim->fdwrite, buffer, size);
+            free(buffer);
+
+            if (written < 0 || written != (lfs_ssize_t)size) {
+                fprintf(stderr, "statfailtest: stale write returned %d for %s\n",
+                        (int)written, sim->fdwrite_path);
+                break;
+            }
+        }
+
+        err = lfs_file_sync(&sim->lfs, &sim->fdwrite);
+        if (err) {
+            fprintf(stderr, "statfailtest: stale sync on %s returned %d\n",
+                    sim->fdwrite_path, err);
+        }
+
+        err = lfs_file_close(&sim->lfs, &sim->fdwrite);
+        if (err) {
+            fprintf(stderr, "statfailtest: stale close on %s returned %d\n",
+                    sim->fdwrite_path, err);
+        }
+        sim->fdwrite_open = false;
+        sim->fdwrite_path[0] = '\0';
+    }
+
+    g_flash_fault_injection_start = saved_start;
+    g_flash_fault_injection_enabled = saved_enabled;
     return 0;
 }
 
@@ -1554,25 +1759,27 @@ static int cmd_lschk(sim_state_t *sim, int argc, char **argv) {
     return 0;
 }
 
-static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
+static int cmd_lsrepair_common(sim_state_t *sim, int argc, char **argv,
+        bool default_remove_damaged, bool allow_damaged_option,
+        const char *cmd_name) {
     if (ensure_mounted(sim)) {
         return -1;
     }
 
     char path[SIM_PATH_MAX];
     const char *target = sim->current_path;
-    bool remove_damaged = false;
+    bool remove_damaged = default_remove_damaged;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--damaged") == 0) {
+        if (allow_damaged_option && strcmp(argv[i], "--damaged") == 0) {
             remove_damaged = true;
         } else if (argv[i][0] == '-') {
-            fprintf(stderr, "lsrepair: unknown option %s\n", argv[i]);
+            fprintf(stderr, "%s: unknown option %s\n", cmd_name, argv[i]);
             return -1;
         } else if (target == sim->current_path) {
             target = argv[i];
         } else {
-            fprintf(stderr, "lsrepair: unexpected argument %s\n", argv[i]);
+            fprintf(stderr, "%s: unexpected argument %s\n", cmd_name, argv[i]);
             return -1;
         }
     }
@@ -1590,7 +1797,7 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
         size_t count = 0;
         int err = collect_lschk_entries(sim, path, &entries, &count);
         if (err) {
-            fprintf(stderr, "lsrepair: failed to scan %s: %d\n", path, err);
+            fprintf(stderr, "%s: failed to scan %s: %d\n", cmd_name, path, err);
             return err;
         }
 
@@ -1650,8 +1857,16 @@ static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
         removed++;
     }
 
-    printf("lsrepair summary: removed=%d skipped=%d\n", removed, skipped);
+    printf("%s summary: removed=%d skipped=%d\n", cmd_name, removed, skipped);
     return 0;
+}
+
+static int cmd_lsrepair(sim_state_t *sim, int argc, char **argv) {
+    return cmd_lsrepair_common(sim, argc, argv, false, true, "lsrepair");
+}
+
+static int cmd_lsrepair2(sim_state_t *sim, int argc, char **argv) {
+    return cmd_lsrepair_common(sim, argc, argv, true, false, "lsrepair2");
 }
 
 static int cmd_cd(sim_state_t *sim, int argc, char **argv) {
@@ -1750,34 +1965,18 @@ static int read_file_alloc(sim_state_t *sim, const char *path, uint8_t **buffer,
 
 static int read_device_bytes(
         sim_state_t *sim, uint64_t offset, void *buffer, size_t size) {
-    uint8_t *cursor = buffer;
-    size_t remaining = size;
-
-    off_t pos = lseek(sim->bd.fd, (off_t)offset, SEEK_SET);
-    if (pos < 0) {
-        int err = -errno;
-        fprintf(stderr, "device read seek failed at 0x%"PRIx64": %d\n",
-                offset, err);
-        return err;
+    if (!sim->device_open || sim->bd.buffer == NULL) {
+        fprintf(stderr, "device is not open\n");
+        return -1;
     }
 
-    while (remaining > 0) {
-        ssize_t res = read(sim->bd.fd, cursor, remaining);
-        if (res < 0) {
-            int err = -errno;
-            fprintf(stderr, "device read failed at 0x%"PRIx64": %d\n",
-                    offset + (uint64_t)(cursor - (uint8_t*)buffer), err);
-            return err;
-        }
-        if (res == 0) {
-            memset(cursor, 0xff, remaining);
-            break;
-        }
-
-        cursor += res;
-        remaining -= (size_t)res;
+    uint64_t total = (uint64_t)sim->storage.block_size * sim->storage.block_count;
+    if (offset > total || size > (size_t)(total - offset)) {
+        fprintf(stderr, "device read exceeds bounds at 0x%"PRIx64"\n", offset);
+        return -1;
     }
 
+    memcpy(buffer, sim->bd.buffer + offset, size);
     return 0;
 }
 
@@ -2840,6 +3039,233 @@ cleanup:
     return err;
 }
 
+static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: statfailtest <count> [output-file]\n");
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "statfailtest: invalid count %s\n", argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], target_dir, output_path, sizeof(output_path));
+        log_file = fopen(output_path, "wb");
+        if (!log_file) {
+            fprintf(stderr, "statfailtest: failed to open %s\n", output_path);
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0) {
+            fprintf(stderr, "statfailtest: failed to duplicate stdio\n");
+            if (saved_stdout >= 0) {
+                close(saved_stdout);
+            }
+            if (saved_stderr >= 0) {
+                close(saved_stderr);
+            }
+            fclose(log_file);
+            return -1;
+        }
+
+        if (dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            fprintf(stderr, "statfailtest: failed to redirect output\n");
+            close(saved_stdout);
+            close(saved_stderr);
+            fclose(log_file);
+            return -1;
+        }
+        printf("statfailtest log path: %s\n", output_path);
+    }
+
+    struct lfs_info info;
+    int err = 0;
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) {
+                goto cleanup;
+            }
+        }
+    }
+
+    err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        goto cleanup;
+    }
+
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+
+    for (lfs_size_t iteration = 0; iteration < count; iteration++) {
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+            err = run_internal_command(sim, "create PWR.IDX");
+            if (err) {
+                goto cleanup;
+            }
+        } else {
+            run_internal_command(sim, "read PWR.IDX");
+        }
+
+        int inner_loops = 2 + (rand() % 2);
+        for (int step = 0; step < inner_loops; step++) {
+            size_t pwr_count = 0;
+            bool have_any = false;
+            uint32_t min_index = 0;
+            uint32_t max_index = 0;
+            err = scan_pwr_files(sim, sim->current_path,
+                    &pwr_count, &have_any, &min_index, &max_index);
+            if (err) {
+                fprintf(stderr, "statfailtest: scan failed: %d\n", err);
+                goto cleanup;
+            }
+
+            uint32_t next_index = have_any ? (max_index + 1u) : 0u;
+            char base_name[16];
+            char new_name[32];
+            snprintf(base_name, sizeof(base_name), "%08"PRIu32, next_index);
+            snprintf(new_name, sizeof(new_name), "%s.PWR", base_name);
+
+            if ((rand() % 5) == 0) {
+                inject_deleted_handle_write(sim, base_name);
+            } else {
+                run_internal_command(sim, "create %s", new_name);
+
+                int writes = 1 + (rand() % 2);
+                for (int i = 0; i < writes; i++) {
+                    int chunk_k = 1 + (rand() % 3);
+                    int chunk_size = chunk_k * 1024;
+                    run_internal_command(sim, "write %s %d --append", new_name, chunk_size);
+                }
+                g_flash_fault_injection_start = 0;
+                g_flash_fault_injection_enabled = 0;
+            }
+
+            int idx_writes = 1 + (rand() % 2);
+            for (int i = 0; i < idx_writes; i++) {
+                run_internal_command(sim, "write PWR.IDX 988 --append");
+                g_flash_fault_injection_start = 0;
+                g_flash_fault_injection_enabled = 0;
+            }
+
+            if ((rand() % 3) != 0) {
+                if ((rand() % 3) == 0) {
+                    g_flash_fault_injection_start = 1;
+                    sleep_ms(150u + (unsigned)(rand() % 101));
+                }
+                if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
+                    run_internal_command(sim, "rm PWR.IDX.tmp");
+                }
+                run_internal_command(sim, "cp PWR.IDX PWR.IDX.tmp");
+                run_internal_command(sim, "rm PWR.IDX");
+                run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+                g_flash_fault_injection_start = 0;
+                g_flash_fault_injection_enabled = 0;
+            }
+
+            err = scan_pwr_files(sim, sim->current_path,
+                    &pwr_count, &have_any, &min_index, &max_index);
+            if (err) {
+                fprintf(stderr, "statfailtest: rescan failed: %d\n", err);
+                goto cleanup;
+            }
+            if (pwr_count > 24 && have_any) {
+                char oldest_name[32];
+                snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+                run_internal_command(sim, "rm %s", oldest_name);
+            }
+        }
+
+        char bad_name[LFS_NAME_MAX + 1] = {0};
+        int stat_err = 0;
+        int scan_res = find_visible_stat_failure(sim, sim->current_path,
+                bad_name, sizeof(bad_name), &stat_err);
+        if (scan_res < 0) {
+            fprintf(stderr, "statfailtest: visible-stat scan failed: %d\n", scan_res);
+            err = scan_res;
+            goto cleanup;
+        }
+
+        if (scan_res > 0) {
+            char bad_path[SIM_PATH_MAX];
+            build_child_path(sim->current_path, bad_name, bad_path, sizeof(bad_path));
+            printf("statfailtest hit at iteration %"PRIu32": readdir sees %s but stat returns %d\n",
+                    (uint32_t)(iteration + 1), bad_name, stat_err);
+            if (stat_err == LFS_ERR_NOENT) {
+                printf("statfailtest candidate fetchmatch symptom detected on %s\n", bad_path);
+            }
+
+            run_internal_command(sim, "lschk .");
+            printf("\nDirectory metadata dump follows:\n\n");
+            meta_dump_target(sim, sim->current_path, false, false, stdout);
+
+            char meta_path[SIM_PATH_MAX];
+            resolve_export_path("statfailtest_hit_meta.txt", sim->current_path,
+                    meta_path, sizeof(meta_path));
+            FILE *meta_file = fopen(meta_path, "wb");
+            if (meta_file) {
+                meta_dump_target(sim, sim->current_path, false, false, meta_file);
+                fclose(meta_file);
+                printf("statfailtest metadata saved to %s\n", meta_path);
+            } else {
+                fprintf(stderr, "statfailtest: failed to export metadata to %s\n", meta_path);
+            }
+
+            err = 0;
+            goto cleanup;
+        }
+
+        if (log_file) {
+            emit_progress_tick(saved_stdout);
+        }
+    }
+
+    printf("statfailtest completed: %"PRIu32" iterations, no visible/stat mismatch found\n",
+            (uint32_t)count);
+    err = 0;
+
+cleanup:
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("statfailtest output saved to %s\n", output_path);
+    }
+    return err;
+}
+
 static int cmd_mkdir(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
         fprintf(stderr, "usage: mkdir <dir>\n");
@@ -3524,6 +3950,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     if (strcmp(argv[0], "lsrepair") == 0) {
         return cmd_lsrepair(sim, argc, argv);
     }
+    if (strcmp(argv[0], "lsrepair2") == 0) {
+        return cmd_lsrepair2(sim, argc, argv);
+    }
     if (strcmp(argv[0], "cd") == 0) {
         return cmd_cd(sim, argc, argv);
     }
@@ -3553,6 +3982,9 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "faulttest") == 0) {
         return cmd_faulttest(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "statfailtest") == 0) {
+        return cmd_statfailtest(sim, argc, argv);
     }
     if (strcmp(argv[0], "mkdir") == 0) {
         return cmd_mkdir(sim, argc, argv);

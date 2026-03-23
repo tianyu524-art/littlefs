@@ -7,6 +7,46 @@
  */
 #include "bd/lfs_rambd.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+extern volatile int g_flash_fault_injection_enabled;
+extern volatile int g_flash_fault_injection_start;
+
+#ifdef _WIN32
+static DWORD WINAPI lfs_rambd_fault_worker(LPVOID arg) {
+    (void)arg;
+    while (1) {
+        DWORD delay_ms = 100u + (DWORD)(rand() % 401);
+        Sleep(delay_ms);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 1;
+        }
+    }
+    return 0;
+}
+#else
+static void *lfs_rambd_fault_worker(void *arg) {
+    (void)arg;
+    while (1) {
+        unsigned delay_ms = 100u + (unsigned)(rand() % 401);
+        usleep(delay_ms * 1000u);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 1;
+        }
+    }
+    return NULL;
+}
+#endif
+
 int lfs_rambd_createcfg(const struct lfs_config *cfg,
         const struct lfs_rambd_config *bdcfg) {
     LFS_RAMBD_TRACE("lfs_rambd_createcfg(%p {.context=%p, "
@@ -21,6 +61,9 @@ int lfs_rambd_createcfg(const struct lfs_config *cfg,
             (void*)bdcfg, bdcfg->erase_value, bdcfg->buffer);
     lfs_rambd_t *bd = cfg->context;
     bd->cfg = bdcfg;
+    g_flash_fault_injection_enabled = 0;
+    g_flash_fault_injection_start = 1;
+    srand((unsigned)time(NULL));
 
     // allocate buffer?
     if (bd->cfg->buffer) {
@@ -40,6 +83,18 @@ int lfs_rambd_createcfg(const struct lfs_config *cfg,
     } else {
         memset(bd->buffer, 0, cfg->block_size * cfg->block_count);
     }
+
+#ifdef _WIN32
+    HANDLE worker = CreateThread(NULL, 0, lfs_rambd_fault_worker, NULL, 0, NULL);
+    if (worker) {
+        CloseHandle(worker);
+    }
+#else
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, lfs_rambd_fault_worker, NULL) == 0) {
+        pthread_detach(worker);
+    }
+#endif
 
     LFS_RAMBD_TRACE("lfs_rambd_createcfg -> %d", 0);
     return 0;
@@ -110,8 +165,28 @@ int lfs_rambd_prog(const struct lfs_config *cfg, lfs_block_t block,
         }
     }
 
+    uint8_t *fault_buffer = NULL;
+    const void *write_buffer = buffer;
+    if (g_flash_fault_injection_enabled && size > 0 && size < 256) {
+        fault_buffer = lfs_malloc(size);
+        if (!fault_buffer) {
+            LFS_RAMBD_TRACE("lfs_rambd_prog -> %d", LFS_ERR_NOMEM);
+            return LFS_ERR_NOMEM;
+        }
+
+        memcpy(fault_buffer, buffer, size);
+        lfs_size_t fault_offset = (lfs_size_t)(rand() % size);
+        fault_buffer[fault_offset] = rand() % 0xff;
+        write_buffer = fault_buffer;
+        g_flash_fault_injection_enabled = 0;
+        printf("\n***#####flash error#####***\n");
+    }
+
     // program data
-    memcpy(&bd->buffer[block*cfg->block_size + off], buffer, size);
+    memcpy(&bd->buffer[block*cfg->block_size + off], write_buffer, size);
+    if (fault_buffer) {
+        lfs_free(fault_buffer);
+    }
 
     LFS_RAMBD_TRACE("lfs_rambd_prog -> %d", 0);
     return 0;
