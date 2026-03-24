@@ -41,7 +41,7 @@ extern volatile int g_flash_fault_injection_enabled;
 #define SIM_ARGV_MAX 64
 #define SIM_READ_CHUNK 4096
 
-#define DEFAULT_BLOCK_SIZE      (1u * 1024u)
+#define DEFAULT_BLOCK_SIZE      (8u * 1024u)
 #define DEFAULT_BLOCK_COUNT     256u
 #define DEFAULT_READ_SIZE       16u
 #define DEFAULT_PROG_SIZE       16u
@@ -3501,6 +3501,8 @@ static int cmd_stat(sim_state_t *sim, int argc, char **argv) {
     printf("path : %s\n", path);
     printf("type : %s\n", (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE");
     printf("size : %"PRIu32"\n", (uint32_t)info.size);
+    printf("ctime : %"PRIx64"\n", info.ctime);
+    printf("mtime : %"PRIx64"\n", info.mtime);
     return 0;
 }
 

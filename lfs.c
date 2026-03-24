@@ -7,7 +7,7 @@
  */
 #include "lfs.h"
 #include "lfs_util.h"
-
+#include <time.h>
 
 // some constants used throughout the code
 #define LFS_BLOCK_NULL ((lfs_block_t)-1)
@@ -25,7 +25,15 @@ enum {
     LFS_CMP_GT = 2,
 };
 
+lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
+        uint8_t type, void *buffer, lfs_size_t size);
+int lfs_setattr(lfs_t *lfs, const char *path,
+        uint8_t type, const void *buffer, lfs_size_t size);
 
+static uint64_t lfs_now(void) {
+    time_t now = time(NULL);
+    return (now > 0) ? (uint64_t)now : 0;
+}
 /// Caching block device operations ///
 
 static inline void lfs_cache_drop(lfs_t *lfs, lfs_cache_t *rcache) {
@@ -473,6 +481,22 @@ static void lfs_mlist_append(lfs_t *lfs, struct lfs_mlist *mlist) {
     lfs->mlist = mlist;
 }
 
+void *lfs_mlist_find(struct lfs_mlist *mlist, char *path,uint8_t *outtype)
+{
+    for (struct lfs_mlist *current = mlist; current; current = current->next)
+    {
+        if (current->type == LFS_TYPE_REG)
+        {
+            lfs_file_t *handle = (lfs_file_t *)current;
+            if(strcmp(handle->path, path) == 0)
+            {
+                *outtype = current->type;
+                return current;
+            }
+        }
+    }    
+    return NULL;
+}
 
 /// Internal operations predeclared here ///
 #ifndef LFS_READONLY
@@ -2897,6 +2921,13 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
             goto cleanup;
         }
 
+        /* 增加时间戳 */
+        {
+            file->mtimeflag = file->ctimeflag = true;
+            file->mtime = file->ctime = lfs_now();
+            //printf("lfs_file_rawopencfg mtimeflag set\n");
+        }
+
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, 0, 0);
     } else if (flags & LFS_O_EXCL) {
         err = LFS_ERR_EXIST;
@@ -3449,6 +3480,12 @@ static lfs_ssize_t lfs_file_rawwrite(lfs_t *lfs, lfs_file_t *file,
         return nsize;
     }
 
+    {
+        file->mtimeflag = true;
+        file->mtime = lfs_now();
+        //printf("lfs_file_rawwrite mtimeflag set\n");
+    }
+
     file->flags &= ~LFS_F_ERRED;
     return nsize;
 }
@@ -3604,10 +3641,75 @@ static lfs_soff_t lfs_file_rawsize(lfs_t *lfs, lfs_file_t *file) {
 /// General fs operations ///
 static int lfs_rawstat(lfs_t *lfs, const char *path, struct lfs_info *info) {
     lfs_mdir_t cwd;
+    char tmppath[LFS_NAME_MAX+1];
+    memcpy(tmppath, path, strlen(path)+1);
+
     lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, NULL);
     if (tag < 0) {
         return (int)tag;
     }
+
+    {
+        uint64_t mtime;
+        uint64_t ctime;
+        uint8_t type=0xff;
+        lfs_file_t *file;
+        int32_t res;
+        void *handle = lfs_mlist_find(lfs->mlist, tmppath, &type);
+        if (handle)
+        {
+            /* code */
+            if (type == LFS_TYPE_REG)
+            {
+                /* code */
+                file = (lfs_file_t *)handle;
+                if (file->mtimeflag)
+                {
+                    info->mtime = file->mtime;
+                } else {
+                    res = lfs_getattr(lfs, tmppath, LFS_ATTR_MTIME, &mtime, sizeof(mtime));
+                    if (res > 0)
+                    {
+                        info->mtime = mtime;
+                    } else {
+                        info->mtime = 0;
+                    }                   
+                }
+
+                if (file->ctimeflag)
+                {
+                    info->ctime = file->ctime;
+                } else {
+                    res = lfs_getattr(lfs, tmppath, LFS_ATTR_CTIME, &ctime, sizeof(ctime));
+                    if (res > 0)
+                    {
+                        info->ctime = ctime;
+                    } else {
+                        info->ctime = 0;
+                    }                   
+                }
+                
+            }            
+        } else {
+            res = lfs_getattr(lfs, tmppath, LFS_ATTR_MTIME, &mtime, sizeof(mtime));
+            if (res > 0)
+            {
+                info->mtime = mtime;
+            } else {
+                info->mtime = 0;
+            } 
+            res = lfs_getattr(lfs, tmppath, LFS_ATTR_CTIME, &ctime, sizeof(ctime));
+            if (res > 0)
+            {
+                info->ctime = ctime;
+            } else {
+                info->ctime = 0;
+            }
+        }
+        
+
+    }
+
 
     return lfs_dir_getinfo(lfs, &cwd, lfs_tag_id(tag), info);
 }
@@ -3693,6 +3795,30 @@ static int lfs_rawremove(lfs_t *lfs, const char *path) {
 
 #ifndef LFS_READONLY
 static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
+
+    char oldname[LFS_NAME_MAX+1];
+    char newname[LFS_NAME_MAX+1];
+    uint64_t oldmtime = 0,tmpmtime = 0;
+    strncpy(oldname, oldpath, strlen(oldpath)+1);
+    strncpy(newname, newpath, strlen(newpath)+1);
+    {
+        uint8_t type = 0xff;
+        int32_t res;
+        void *handle = lfs_mlist_find(lfs->mlist, oldname, &type);
+        if (handle && (type == LFS_TYPE_REG))
+        {
+            oldmtime = ((lfs_file_t *)handle)->mtime;
+        } else {
+            res = lfs_getattr(lfs, oldname, LFS_ATTR_MTIME, &tmpmtime, sizeof(tmpmtime));
+            if (res > 0)
+            {
+                oldmtime = tmpmtime;
+            } else {
+                oldmtime = 0;
+            }
+        }      
+    }
+
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
     if (err) {
@@ -3821,6 +3947,20 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
         if (err) {
             return err;
         }
+    }
+
+    {
+        uint8_t type = 0xff;
+        uint64_t current = lfs_now();
+        void *handle = lfs_mlist_find(lfs->mlist, oldname, &type);
+        if (handle && (type == LFS_TYPE_REG))
+        {
+            ((lfs_file_t *)handle)->mtime = oldmtime;
+            ((lfs_file_t *)handle)->ctime = current;
+        } else {
+            lfs_setattr(lfs, newname, LFS_ATTR_MTIME, &oldmtime, sizeof(oldmtime));
+            lfs_setattr(lfs, newname, LFS_ATTR_CTIME, &current, sizeof(current));
+        }      
     }
 
     return 0;
@@ -5704,7 +5844,13 @@ int lfs_file_open(lfs_t *lfs, lfs_file_t *file, const char *path, int flags) {
             (void*)lfs, (void*)file, path, flags);
     LFS_ASSERT(!lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
 
+    file->mtimeflag = false;
+    file->ctimeflag = false;    
     err = lfs_file_rawopen(lfs, file, path, flags);
+    /* 保存fullpath+filename， close时使用 */
+    strncpy(file->path, path, sizeof(file->path) - 1);
+    file->path[sizeof(file->path) - 1] = '\0';
+    
 
     LFS_TRACE("lfs_file_open -> %d", err);
     LFS_UNLOCK(lfs->cfg);
@@ -5740,7 +5886,27 @@ int lfs_file_close(lfs_t *lfs, lfs_file_t *file) {
     LFS_TRACE("lfs_file_close(%p, %p)", (void*)lfs, (void*)file);
     LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
 
+
+
     err = lfs_file_rawclose(lfs, file);
+
+    if(0 == err)
+    {
+        uint64_t time = file->ctime;
+        if (file->ctimeflag)
+        {
+            lfs_setattr(lfs, file->path, LFS_ATTR_CTIME, &time, sizeof(time));
+            file->ctimeflag = false;
+            //printf("lfs_file_close lfs_setattr ctime\n");
+        }
+        if (file->mtimeflag)
+        {
+            time = file->mtime;
+            lfs_setattr(lfs, file->path, LFS_ATTR_MTIME, &time, sizeof(time));
+            file->mtimeflag = false;
+            //printf("lfs_file_close lfs_setattr mtime\n");
+        }      
+    }
 
     LFS_TRACE("lfs_file_close -> %d", err);
     LFS_UNLOCK(lfs->cfg);

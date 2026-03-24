@@ -40,7 +40,7 @@ static void *lfs_rambd_fault_worker(void *arg) {
         unsigned delay_ms = 100u + (unsigned)(rand() % 401);
         usleep(delay_ms * 1000u);
         if (g_flash_fault_injection_start == 1) {
-            g_flash_fault_injection_enabled = 1;
+            g_flash_fault_injection_enabled = 0;
         }
     }
     return NULL;
@@ -62,7 +62,7 @@ int lfs_rambd_createcfg(const struct lfs_config *cfg,
     lfs_rambd_t *bd = cfg->context;
     bd->cfg = bdcfg;
     g_flash_fault_injection_enabled = 0;
-    g_flash_fault_injection_start = 1;
+    g_flash_fault_injection_start = 0;
     srand((unsigned)time(NULL));
 
     // allocate buffer?
@@ -179,7 +179,7 @@ int lfs_rambd_prog(const struct lfs_config *cfg, lfs_block_t block,
         fault_buffer[fault_offset] = rand() % 0xff;
         write_buffer = fault_buffer;
         g_flash_fault_injection_enabled = 0;
-        printf("\n***#####flash error#####***\n");
+        printf("\n***#####rambd flash error#####***\n");
     }
 
     // program data
