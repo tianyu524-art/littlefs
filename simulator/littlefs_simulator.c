@@ -179,6 +179,8 @@ static int scan_pwr_files(sim_state_t *sim, const char *path,
         uint32_t *max_index_out);
 static int find_visible_stat_failure(sim_state_t *sim, const char *path,
         char *name_out, size_t name_out_size, int *stat_err_out);
+static int statfailtest_checkpoint(sim_state_t *sim, lfs_size_t iteration,
+        const char *reason);
 static int inject_deleted_handle_write(sim_state_t *sim, const char *base_name);
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
 static int cmd_faulttest(sim_state_t *sim, int argc, char **argv);
@@ -1376,6 +1378,51 @@ static int find_visible_stat_failure(sim_state_t *sim, const char *path,
     if (err < 0) {
         return err;
     }
+    return 0;
+}
+
+static int statfailtest_checkpoint(sim_state_t *sim, lfs_size_t iteration,
+        const char *reason) {
+    char bad_name[LFS_NAME_MAX + 1] = {0};
+    int stat_err = 0;
+    int scan_res = find_visible_stat_failure(sim, sim->current_path,
+            bad_name, sizeof(bad_name), &stat_err);
+    if (scan_res < 0) {
+        fprintf(stderr, "statfailtest: visible-stat scan failed after %s: %d\n",
+                reason, scan_res);
+        return scan_res;
+    }
+
+    if (scan_res > 0) {
+        char bad_path[SIM_PATH_MAX];
+        build_child_path(sim->current_path, bad_name, bad_path, sizeof(bad_path));
+        printf("statfailtest hit at iteration %"PRIu32" after %s: readdir sees %s but stat returns %d\n",
+                (uint32_t)(iteration + 1), reason, bad_name, stat_err);
+        if (stat_err == LFS_ERR_NOENT) {
+            printf("statfailtest candidate fetchmatch symptom detected on %s\n",
+                    bad_path);
+        }
+
+        run_internal_command(sim, "lschk .");
+        printf("\nDirectory metadata dump follows:\n\n");
+        meta_dump_target(sim, sim->current_path, false, false, stdout);
+
+        char meta_path[SIM_PATH_MAX];
+        resolve_export_path("statfailtest_hit_meta.txt", sim->current_path,
+                meta_path, sizeof(meta_path));
+        FILE *meta_file = fopen(meta_path, "wb");
+        if (meta_file) {
+            meta_dump_target(sim, sim->current_path, false, false, meta_file);
+            fclose(meta_file);
+            printf("statfailtest metadata saved to %s\n", meta_path);
+        } else {
+            fprintf(stderr, "statfailtest: failed to export metadata to %s\n",
+                    meta_path);
+        }
+
+        return 1;
+    }
+
     return 0;
 }
 
@@ -3133,7 +3180,7 @@ static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
             run_internal_command(sim, "read PWR.IDX");
         }
 
-        int inner_loops = 2 + (rand() % 2);
+        int inner_loops = 4 + (rand() % 3);
         for (int step = 0; step < inner_loops; step++) {
             size_t pwr_count = 0;
             bool have_any = false;
@@ -3152,14 +3199,14 @@ static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
             snprintf(base_name, sizeof(base_name), "%08"PRIu32, next_index);
             snprintf(new_name, sizeof(new_name), "%s.PWR", base_name);
 
-            if ((rand() % 5) == 0) {
+            if ((rand() % 2) == 0) {
                 inject_deleted_handle_write(sim, base_name);
             } else {
                 run_internal_command(sim, "create %s", new_name);
 
                 int writes = 1 + (rand() % 2);
                 for (int i = 0; i < writes; i++) {
-                    int chunk_k = 1 + (rand() % 3);
+                    int chunk_k = 1 + (rand() % 2);
                     int chunk_size = chunk_k * 1024;
                     run_internal_command(sim, "write %s %d --append", new_name, chunk_size);
                 }
@@ -3167,18 +3214,31 @@ static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
                 g_flash_fault_injection_enabled = 0;
             }
 
-            int idx_writes = 1 + (rand() % 2);
+            err = statfailtest_checkpoint(sim, iteration, "pwr-write");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+
+            int idx_writes = 2 + (rand() % 2);
             for (int i = 0; i < idx_writes; i++) {
                 run_internal_command(sim, "write PWR.IDX 988 --append");
                 g_flash_fault_injection_start = 0;
                 g_flash_fault_injection_enabled = 0;
             }
-
-            if ((rand() % 3) != 0) {
-                if ((rand() % 3) == 0) {
-                    g_flash_fault_injection_start = 1;
-                    sleep_ms(150u + (unsigned)(rand() % 101));
+            err = statfailtest_checkpoint(sim, iteration, "idx-append");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
                 }
+                goto cleanup;
+            }
+
+            if (true) {
+                g_flash_fault_injection_start = 1;
+                sleep_ms(120u + (unsigned)(rand() % 121));
                 if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
                     run_internal_command(sim, "rm PWR.IDX.tmp");
                 }
@@ -3187,6 +3247,13 @@ static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
                 run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
                 g_flash_fault_injection_start = 0;
                 g_flash_fault_injection_enabled = 0;
+            }
+            err = statfailtest_checkpoint(sim, iteration, "idx-rename");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
             }
 
             err = scan_pwr_files(sim, sim->current_path,
@@ -3200,44 +3267,19 @@ static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv) {
                 snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
                 run_internal_command(sim, "rm %s", oldest_name);
             }
-        }
-
-        char bad_name[LFS_NAME_MAX + 1] = {0};
-        int stat_err = 0;
-        int scan_res = find_visible_stat_failure(sim, sim->current_path,
-                bad_name, sizeof(bad_name), &stat_err);
-        if (scan_res < 0) {
-            fprintf(stderr, "statfailtest: visible-stat scan failed: %d\n", scan_res);
-            err = scan_res;
-            goto cleanup;
-        }
-
-        if (scan_res > 0) {
-            char bad_path[SIM_PATH_MAX];
-            build_child_path(sim->current_path, bad_name, bad_path, sizeof(bad_path));
-            printf("statfailtest hit at iteration %"PRIu32": readdir sees %s but stat returns %d\n",
-                    (uint32_t)(iteration + 1), bad_name, stat_err);
-            if (stat_err == LFS_ERR_NOENT) {
-                printf("statfailtest candidate fetchmatch symptom detected on %s\n", bad_path);
+            err = statfailtest_checkpoint(sim, iteration, "cleanup");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
             }
-
-            run_internal_command(sim, "lschk .");
-            printf("\nDirectory metadata dump follows:\n\n");
-            meta_dump_target(sim, sim->current_path, false, false, stdout);
-
-            char meta_path[SIM_PATH_MAX];
-            resolve_export_path("statfailtest_hit_meta.txt", sim->current_path,
-                    meta_path, sizeof(meta_path));
-            FILE *meta_file = fopen(meta_path, "wb");
-            if (meta_file) {
-                meta_dump_target(sim, sim->current_path, false, false, meta_file);
-                fclose(meta_file);
-                printf("statfailtest metadata saved to %s\n", meta_path);
-            } else {
-                fprintf(stderr, "statfailtest: failed to export metadata to %s\n", meta_path);
+        }
+        err = statfailtest_checkpoint(sim, iteration, "iteration-end");
+        if (err) {
+            if (err > 0) {
+                err = 0;
             }
-
-            err = 0;
             goto cleanup;
         }
 
