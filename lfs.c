@@ -5584,19 +5584,20 @@ cleanup:
     return (int)tag;
 }
 
-int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
+int lfs_debug_probeentryat(lfs_t *lfs, const lfs_block_t pair[2],
         uint16_t id, lfs_debug_entry_t *entry) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
         return err;
     }
-    LFS_TRACE("lfs_debug_probeentry(%p, \"%s\", %"PRIu16", %p)",
-            (void*)lfs, dirpath, id, (void*)entry);
+    LFS_TRACE("lfs_debug_probeentryat(%p, {0x%"PRIx32", 0x%"PRIx32"}, %"PRIu16", %p)",
+            (void*)lfs, pair[0], pair[1], id, (void*)entry);
 
     memset(entry, 0, sizeof(*entry));
 
     lfs_dir_t dir;
-    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    memset(&dir, 0, sizeof(dir));
+    err = lfs_dir_fetch(lfs, &dir.m, pair);
     if (err) {
         goto cleanup;
     }
@@ -5663,9 +5664,32 @@ int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
 close_dir:
     lfs_dir_rawclose(lfs, &dir);
 cleanup:
-    LFS_TRACE("lfs_debug_probeentry -> %d", err);
+    LFS_TRACE("lfs_debug_probeentryat -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
+}
+
+int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
+        uint16_t id, lfs_debug_entry_t *entry) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_debug_probeentry(%p, \"%s\", %"PRIu16", %p)",
+            (void*)lfs, dirpath, id, (void*)entry);
+
+    lfs_dir_t dir;
+    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    if (err) {
+        LFS_UNLOCK(lfs->cfg);
+        return err;
+    }
+
+    lfs_block_t pair[2] = {dir.m.pair[0], dir.m.pair[1]};
+    lfs_dir_rawclose(lfs, &dir);
+    LFS_UNLOCK(lfs->cfg);
+
+    return lfs_debug_probeentryat(lfs, pair, id, entry);
 }
 
 #ifndef LFS_READONLY
@@ -5685,14 +5709,14 @@ int lfs_remove(lfs_t *lfs, const char *path) {
 #endif
 
 #ifndef LFS_READONLY
-int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
-        const char *name, uint16_t id) {
+int lfs_debug_removeghostat(lfs_t *lfs, const char *dirpath,
+        const lfs_block_t pair[2], const char *name, uint16_t id) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
         return err;
     }
-    LFS_TRACE("lfs_debug_removeghost(%p, \"%s\", \"%s\", %"PRIu16")",
-            (void*)lfs, dirpath, name, id);
+    LFS_TRACE("lfs_debug_removeghostat(%p, \"%s\", {0x%"PRIx32", 0x%"PRIx32"}, \"%s\", %"PRIu16")",
+            (void*)lfs, dirpath, pair[0], pair[1], name, id);
 
     err = lfs_fs_forceconsistency(lfs);
     if (err) {
@@ -5700,7 +5724,8 @@ int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
     }
 
     lfs_dir_t dir;
-    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    memset(&dir, 0, sizeof(dir));
+    err = lfs_dir_fetch(lfs, &dir.m, pair);
     if (err) {
         goto cleanup;
     }
@@ -5748,9 +5773,32 @@ int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
 close_dir:
     lfs_dir_rawclose(lfs, &dir);
 cleanup:
-    LFS_TRACE("lfs_debug_removeghost -> %d", err);
+    LFS_TRACE("lfs_debug_removeghostat -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
+}
+
+int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
+        const char *name, uint16_t id) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_debug_removeghost(%p, \"%s\", \"%s\", %"PRIu16")",
+            (void*)lfs, dirpath, name, id);
+
+    lfs_dir_t dir;
+    err = lfs_dir_rawopen(lfs, &dir, dirpath);
+    if (err) {
+        LFS_UNLOCK(lfs->cfg);
+        return err;
+    }
+
+    lfs_block_t pair[2] = {dir.m.pair[0], dir.m.pair[1]};
+    lfs_dir_rawclose(lfs, &dir);
+    LFS_UNLOCK(lfs->cfg);
+
+    return lfs_debug_removeghostat(lfs, dirpath, pair, name, id);
 }
 #endif
 

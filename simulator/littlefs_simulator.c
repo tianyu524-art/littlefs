@@ -27,6 +27,7 @@
 #define dup2 _dup2
 #define fileno _fileno
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -41,7 +42,7 @@ extern volatile int g_flash_fault_injection_enabled;
 #define SIM_ARGV_MAX 64
 #define SIM_READ_CHUNK 4096
 
-#define DEFAULT_BLOCK_SIZE      (8u * 1024u)
+#define DEFAULT_BLOCK_SIZE      (2u * 1024u)
 #define DEFAULT_BLOCK_COUNT     256u
 #define DEFAULT_READ_SIZE       16u
 #define DEFAULT_PROG_SIZE       16u
@@ -125,8 +126,17 @@ typedef struct lschk_entry {
     bool has_name;
     bool has_struct;
     bool data_valid;
+    bool probe_failed;
     lschk_status_t status;
 } lschk_entry_t;
+
+typedef struct chaosrace_worker {
+    sim_state_t *sim;
+    volatile int *stop;
+    uint32_t seed;
+    uint32_t next_index;
+    int role;
+} chaosrace_worker_t;
 
 static char g_exe_dir[SIM_PATH_MAX];
 
@@ -182,9 +192,25 @@ static int find_visible_stat_failure(sim_state_t *sim, const char *path,
 static int statfailtest_checkpoint(sim_state_t *sim, lfs_size_t iteration,
         const char *reason);
 static int inject_deleted_handle_write(sim_state_t *sim, const char *base_name);
+static int inject_recreated_path_stale_close(sim_state_t *sim, const char *base_name);
+static int inject_idx_rename_recreate_handle(sim_state_t *sim);
+static int inject_dual_idx_handle_crossclose(sim_state_t *sim);
+static int inject_multi_pwr_stale_batch(sim_state_t *sim, uint32_t start_index);
+static int idxstress_checkpoint(sim_state_t *sim, lfs_size_t iteration,
+        const char *reason, bool allow_tmp, bool stop_on_nonreal);
+static uint32_t chaosrace_next_u32(uint32_t *state);
+#ifdef _WIN32
+static DWORD WINAPI chaosrace_worker_thread(LPVOID arg);
+#else
+static void *chaosrace_worker_thread(void *arg);
+#endif
 static int cmd_test(sim_state_t *sim, int argc, char **argv);
 static int cmd_faulttest(sim_state_t *sim, int argc, char **argv);
 static int cmd_statfailtest(sim_state_t *sim, int argc, char **argv);
+static int cmd_idxstress(sim_state_t *sim, int argc, char **argv);
+static int cmd_chaosstress(sim_state_t *sim, int argc, char **argv);
+static int cmd_chaosstressdeep(sim_state_t *sim, int argc, char **argv);
+static int cmd_chaosrace(sim_state_t *sim, int argc, char **argv);
 static int cmd_ops(sim_state_t *sim, int argc, char **argv);
 static int cmd_renametest(sim_state_t *sim, int argc, char **argv);
 
@@ -391,6 +417,10 @@ static void print_help(void) {
     printf("  renametest <count>\n");
     printf("  faulttest <count> [output-file]\n");
     printf("  statfailtest <count> [output-file]\n");
+    printf("  idxstress <count> [output-file]\n");
+    printf("  chaosstress <count> [output-file]\n");
+    printf("  chaosstressdeep <count> [output-file]\n");
+    printf("  chaosrace <seconds> [output-file]\n");
     printf("  mkdir <dir>\n");
     printf("  rm <path> [--recursive]\n");
     printf("  cp <src> <dst>\n");
@@ -1496,6 +1526,537 @@ static int inject_deleted_handle_write(sim_state_t *sim, const char *base_name) 
     return 0;
 }
 
+static int inject_recreated_path_stale_close(sim_state_t *sim, const char *base_name) {
+    char rel_path[SIM_PATH_MAX];
+    char path[SIM_PATH_MAX];
+    snprintf(rel_path, sizeof(rel_path), "%s.PWR", base_name);
+    if (resolve_path(sim, rel_path, path, sizeof(path))) {
+        return -1;
+    }
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        fprintf(stderr, "chaosstress: open %s failed: %d\n", path, err);
+        return err;
+    }
+
+    uint8_t buffer[1024];
+    fill_random_bytes(buffer, sizeof(buffer));
+    lfs_ssize_t written = lfs_file_write(&sim->lfs, &file, buffer, sizeof(buffer));
+    if (written < 0 || written != (lfs_ssize_t)sizeof(buffer)) {
+        int write_err = (written < 0) ? (int)written : -1;
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: initial write %s failed: %d\n", path, write_err);
+        return write_err;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &file);
+    if (err) {
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: initial sync %s failed: %d\n", path, err);
+        return err;
+    }
+
+    err = lfs_remove(&sim->lfs, path);
+    if (err) {
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: remove %s failed: %d\n", path, err);
+        return err;
+    }
+
+    run_internal_command(sim, "create %s", rel_path);
+    run_internal_command(sim, "write %s 1024 --append", rel_path);
+
+    fill_random_bytes(buffer, sizeof(buffer));
+    written = lfs_file_write(&sim->lfs, &file, buffer, sizeof(buffer));
+    if (written < 0 || written != (lfs_ssize_t)sizeof(buffer)) {
+        int write_err = (written < 0) ? (int)written : -1;
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: stale recreated write %s failed: %d\n",
+                path, write_err);
+        return 0;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "chaosstress: stale recreated sync %s returned %d\n", path, err);
+    }
+
+    err = lfs_file_close(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "chaosstress: stale recreated close %s returned %d\n", path, err);
+    }
+
+    return 0;
+}
+
+static int inject_idx_rename_recreate_handle(sim_state_t *sim) {
+    char path_tmp[SIM_PATH_MAX];
+    char path_final[SIM_PATH_MAX];
+    struct lfs_info info;
+    if (resolve_path(sim, "PWR.IDX.tmp", path_tmp, sizeof(path_tmp)) ||
+            resolve_path(sim, "PWR.IDX", path_final, sizeof(path_final))) {
+        return -1;
+    }
+
+    if (lfs_stat(&sim->lfs, path_tmp, &info) == 0) {
+        run_internal_command(sim, "rm PWR.IDX.tmp");
+    }
+    if (lfs_stat(&sim->lfs, path_final, &info) < 0) {
+        run_internal_command(sim, "create PWR.IDX");
+        run_internal_command(sim, "write PWR.IDX 988 --append");
+    }
+
+    lfs_file_t file;
+    int err = lfs_file_open(&sim->lfs, &file, path_tmp,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        fprintf(stderr, "chaosstress: open %s failed: %d\n", path_tmp, err);
+        return err;
+    }
+
+    uint8_t *buffer = malloc(988);
+    if (!buffer) {
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: out of memory\n");
+        return -1;
+    }
+
+    fill_random_bytes(buffer, 988);
+    lfs_ssize_t written = lfs_file_write(&sim->lfs, &file, buffer, 988);
+    if (written < 0 || written != 988) {
+        int write_err = (written < 0) ? (int)written : -1;
+        free(buffer);
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: initial idx tmp write failed: %d\n", write_err);
+        return write_err;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &file);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: initial idx tmp sync failed: %d\n", err);
+        return err;
+    }
+
+    err = lfs_rename(&sim->lfs, path_tmp, path_final);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: rename %s -> %s failed: %d\n",
+                path_tmp, path_final, err);
+        return err;
+    }
+
+    run_internal_command(sim, "create PWR.IDX.tmp");
+    if ((rand() % 2) == 0) {
+        run_internal_command(sim, "write PWR.IDX.tmp 128 --append");
+    }
+
+    fill_random_bytes(buffer, 988);
+    written = lfs_file_write(&sim->lfs, &file, buffer, 988);
+    free(buffer);
+    if (written < 0 || written != 988) {
+        int write_err = (written < 0) ? (int)written : -1;
+        lfs_file_close(&sim->lfs, &file);
+        fprintf(stderr, "chaosstress: stale idx write after rename returned %d\n",
+                write_err);
+        return 0;
+    }
+
+    err = lfs_file_sync(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "chaosstress: stale idx sync after rename returned %d\n", err);
+    }
+
+    err = lfs_file_close(&sim->lfs, &file);
+    if (err) {
+        fprintf(stderr, "chaosstress: stale idx close after rename returned %d\n", err);
+    }
+
+    return 0;
+}
+
+static int inject_dual_idx_handle_crossclose(sim_state_t *sim) {
+    char path_tmp[SIM_PATH_MAX];
+    char path_final[SIM_PATH_MAX];
+    struct lfs_info info;
+    if (resolve_path(sim, "PWR.IDX.tmp", path_tmp, sizeof(path_tmp)) ||
+            resolve_path(sim, "PWR.IDX", path_final, sizeof(path_final))) {
+        return -1;
+    }
+
+    if (lfs_stat(&sim->lfs, path_tmp, &info) == 0) {
+        run_internal_command(sim, "rm PWR.IDX.tmp");
+    }
+    if (lfs_stat(&sim->lfs, path_final, &info) < 0) {
+        run_internal_command(sim, "create PWR.IDX");
+        run_internal_command(sim, "write PWR.IDX 988 --append");
+    }
+
+    lfs_file_t final_file;
+    lfs_file_t tmp_file;
+    memset(&final_file, 0, sizeof(final_file));
+    memset(&tmp_file, 0, sizeof(tmp_file));
+    bool final_open = false;
+    bool tmp_open = false;
+
+    int err = lfs_file_open(&sim->lfs, &final_file, path_final, LFS_O_WRONLY);
+    if (err) {
+        fprintf(stderr, "chaosstress: open %s failed: %d\n", path_final, err);
+        return err;
+    }
+    final_open = true;
+
+    uint8_t *buffer = malloc(988);
+    if (!buffer) {
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: out of memory\n");
+        return -1;
+    }
+
+    fill_random_bytes(buffer, 256);
+    lfs_ssize_t written = lfs_file_write(&sim->lfs, &final_file, buffer, 256);
+    if (written < 0 || written != 256) {
+        int write_err = (written < 0) ? (int)written : -1;
+        free(buffer);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: seed write on %s failed: %d\n", path_final, write_err);
+        return write_err;
+    }
+    err = lfs_file_sync(&sim->lfs, &final_file);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: seed sync on %s failed: %d\n", path_final, err);
+        return err;
+    }
+
+    err = lfs_file_open(&sim->lfs, &tmp_file, path_tmp,
+            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: open %s failed: %d\n", path_tmp, err);
+        return err;
+    }
+    tmp_open = true;
+
+    fill_random_bytes(buffer, 988);
+    written = lfs_file_write(&sim->lfs, &tmp_file, buffer, 988);
+    if (written < 0 || written != 988) {
+        int write_err = (written < 0) ? (int)written : -1;
+        free(buffer);
+        lfs_file_close(&sim->lfs, &tmp_file);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: write %s failed: %d\n", path_tmp, write_err);
+        return write_err;
+    }
+    err = lfs_file_sync(&sim->lfs, &tmp_file);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &tmp_file);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: sync %s failed: %d\n", path_tmp, err);
+        return err;
+    }
+
+    err = lfs_remove(&sim->lfs, path_final);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &tmp_file);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: remove %s failed: %d\n", path_final, err);
+        return err;
+    }
+
+    err = lfs_rename(&sim->lfs, path_tmp, path_final);
+    if (err) {
+        free(buffer);
+        lfs_file_close(&sim->lfs, &tmp_file);
+        lfs_file_close(&sim->lfs, &final_file);
+        fprintf(stderr, "chaosstress: rename %s -> %s failed: %d\n",
+                path_tmp, path_final, err);
+        return err;
+    }
+
+    run_internal_command(sim, "create PWR.IDX.tmp");
+    run_internal_command(sim, "write PWR.IDX.tmp 128 --append");
+
+    fill_random_bytes(buffer, 256);
+    written = lfs_file_write(&sim->lfs, &final_file, buffer, 256);
+    if (written < 0 || written != 256) {
+        fprintf(stderr, "chaosstress: stale final write returned %d\n", (int)written);
+    } else {
+        err = lfs_file_sync(&sim->lfs, &final_file);
+        if (err) {
+            fprintf(stderr, "chaosstress: stale final sync returned %d\n", err);
+        }
+    }
+
+    fill_random_bytes(buffer, 512);
+    written = lfs_file_write(&sim->lfs, &tmp_file, buffer, 512);
+    free(buffer);
+    if (written < 0 || written != 512) {
+        fprintf(stderr, "chaosstress: stale tmp write returned %d\n", (int)written);
+    } else {
+        err = lfs_file_sync(&sim->lfs, &tmp_file);
+        if (err) {
+            fprintf(stderr, "chaosstress: stale tmp sync returned %d\n", err);
+        }
+    }
+
+    if (tmp_open) {
+        err = lfs_file_close(&sim->lfs, &tmp_file);
+        if (err) {
+            fprintf(stderr, "chaosstress: stale tmp close returned %d\n", err);
+        }
+    }
+    if (final_open) {
+        err = lfs_file_close(&sim->lfs, &final_file);
+        if (err) {
+            fprintf(stderr, "chaosstress: stale final close returned %d\n", err);
+        }
+    }
+
+    return 0;
+}
+
+static int inject_multi_pwr_stale_batch(sim_state_t *sim, uint32_t start_index) {
+    enum { BATCH_COUNT = 3 };
+    char rel_names[BATCH_COUNT][32];
+    char abs_paths[BATCH_COUNT][SIM_PATH_MAX];
+    lfs_file_t files[BATCH_COUNT];
+    bool opened[BATCH_COUNT] = {false, false, false};
+    uint8_t buffer[1024];
+    int order[BATCH_COUNT] = {0, 1, 2};
+
+    for (int i = 0; i < BATCH_COUNT; i++) {
+        memset(&files[i], 0, sizeof(files[i]));
+        snprintf(rel_names[i], sizeof(rel_names[i]), "%08"PRIu32".PWR", start_index + (uint32_t)i);
+        if (resolve_path(sim, rel_names[i], abs_paths[i], sizeof(abs_paths[i]))) {
+            return -1;
+        }
+
+        int err = lfs_file_open(&sim->lfs, &files[i], abs_paths[i],
+                LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+        if (err) {
+            fprintf(stderr, "chaosstress: open %s failed: %d\n", abs_paths[i], err);
+            goto cleanup;
+        }
+        opened[i] = true;
+
+        fill_random_bytes(buffer, 256);
+        lfs_ssize_t written = lfs_file_write(&sim->lfs, &files[i], buffer, 256);
+        if (written < 0 || written != 256) {
+            fprintf(stderr, "chaosstress: initial multi write %s failed: %d\n",
+                    abs_paths[i], (written < 0) ? (int)written : -1);
+            goto cleanup;
+        }
+
+        err = lfs_file_sync(&sim->lfs, &files[i]);
+        if (err) {
+            fprintf(stderr, "chaosstress: initial multi sync %s failed: %d\n",
+                    abs_paths[i], err);
+            goto cleanup;
+        }
+    }
+
+    for (int i = 0; i < BATCH_COUNT; i++) {
+        int err = lfs_remove(&sim->lfs, abs_paths[i]);
+        if (err) {
+            fprintf(stderr, "chaosstress: multi remove %s failed: %d\n", abs_paths[i], err);
+            goto cleanup;
+        }
+    }
+
+    for (int i = 0; i < BATCH_COUNT; i++) {
+        run_internal_command(sim, "create %s", rel_names[i]);
+        run_internal_command(sim, "write %s 256 --append", rel_names[i]);
+    }
+
+    for (int i = BATCH_COUNT - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+    }
+
+    for (int k = 0; k < BATCH_COUNT; k++) {
+        int i = order[k];
+        fill_random_bytes(buffer, 512);
+        lfs_ssize_t written = lfs_file_write(&sim->lfs, &files[i], buffer, 512);
+        if (written < 0 || written != 512) {
+            fprintf(stderr, "chaosstress: stale multi write %s returned %d\n",
+                    abs_paths[i], (int)written);
+        } else {
+            int err = lfs_file_sync(&sim->lfs, &files[i]);
+            if (err) {
+                fprintf(stderr, "chaosstress: stale multi sync %s returned %d\n",
+                        abs_paths[i], err);
+            }
+        }
+    }
+
+cleanup:
+    for (int i = 0; i < BATCH_COUNT; i++) {
+        if (opened[i]) {
+            int err = lfs_file_close(&sim->lfs, &files[i]);
+            if (err) {
+                fprintf(stderr, "chaosstress: stale multi close %s returned %d\n",
+                        abs_paths[i], err);
+            }
+        }
+    }
+    return 0;
+}
+
+static int idxstress_checkpoint(sim_state_t *sim, lfs_size_t iteration,
+        const char *reason, bool allow_tmp, bool stop_on_nonreal) {
+    int err = statfailtest_checkpoint(sim, iteration, reason);
+    if (err) {
+        return err;
+    }
+
+    lschk_entry_t *entries = NULL;
+    size_t count = 0;
+    err = collect_lschk_entries(sim, sim->current_path, &entries, &count);
+    if (err) {
+        fprintf(stderr, "chaosstress: lschk scan failed after %s: %d\n", reason, err);
+        return err;
+    }
+
+    size_t idx_count = 0;
+    size_t tmp_count = 0;
+    size_t non_real = 0;
+    bool unsorted = false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(entries[i].name, "PWR.IDX") == 0) {
+            idx_count++;
+        } else if (strcmp(entries[i].name, "PWR.IDX.tmp") == 0) {
+            tmp_count++;
+        }
+
+        if (entries[i].status != LSCHK_STATUS_REAL) {
+            non_real++;
+        }
+
+        if (i > 0 && strcmp(entries[i - 1].name, entries[i].name) > 0) {
+            unsorted = true;
+        }
+    }
+
+    if (idx_count > 1 || (stop_on_nonreal && non_real > 0)) {
+        char meta_path[SIM_PATH_MAX];
+        printf("chaosstress candidate at iteration %"PRIu32" after %s: "
+               "idx_count=%"PRIu32" tmp_count=%"PRIu32" non_real=%"PRIu32" unsorted=%s\n",
+                (uint32_t)(iteration + 1), reason,
+                (uint32_t)idx_count, (uint32_t)tmp_count, (uint32_t)non_real,
+                unsorted ? "yes" : "no");
+        run_internal_command(sim, "lschk .");
+        printf("\nDirectory metadata dump follows:\n\n");
+        meta_dump_target(sim, sim->current_path, false, false, stdout);
+        resolve_export_path("chaosstress_hit_meta.txt", sim->current_path,
+                meta_path, sizeof(meta_path));
+        FILE *meta_file = fopen(meta_path, "wb");
+        if (meta_file) {
+            meta_dump_target(sim, sim->current_path, false, false, meta_file);
+            fclose(meta_file);
+            printf("chaosstress metadata saved to %s\n", meta_path);
+        }
+        free(entries);
+        return 1;
+    }
+
+    if ((!allow_tmp && tmp_count > 0) || unsorted || (!stop_on_nonreal && non_real > 0)) {
+        printf("chaosstress soft candidate at iteration %"PRIu32" after %s: "
+               "idx_count=%"PRIu32" tmp_count=%"PRIu32" non_real=%"PRIu32" unsorted=%s\n",
+                (uint32_t)(iteration + 1), reason,
+                (uint32_t)idx_count, (uint32_t)tmp_count, (uint32_t)non_real,
+                unsorted ? "yes" : "no");
+        if (!allow_tmp) {
+            static lfs_size_t last_soft_dump_iteration = (lfs_size_t)-1;
+            if (last_soft_dump_iteration != iteration) {
+                char meta_path[SIM_PATH_MAX];
+                last_soft_dump_iteration = iteration;
+                resolve_export_path("chaosstress_soft_last_meta.txt", sim->current_path,
+                        meta_path, sizeof(meta_path));
+                FILE *meta_file = fopen(meta_path, "wb");
+                if (meta_file) {
+                    meta_dump_target(sim, sim->current_path, false, false, meta_file);
+                    fclose(meta_file);
+                }
+            }
+        }
+    }
+
+    free(entries);
+    return 0;
+}
+
+static uint32_t chaosrace_next_u32(uint32_t *state) {
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI chaosrace_worker_thread(LPVOID arg)
+#else
+static void *chaosrace_worker_thread(void *arg)
+#endif
+{
+    chaosrace_worker_t *worker = (chaosrace_worker_t *)arg;
+    uint32_t state = worker->seed ? worker->seed : 1u;
+
+    while (!*worker->stop) {
+        uint32_t r = chaosrace_next_u32(&state);
+        g_flash_fault_injection_start = 1;
+
+        switch (worker->role) {
+        case 0:
+            inject_idx_rename_recreate_handle(worker->sim);
+            if ((r & 1u) == 0u) {
+                inject_dual_idx_handle_crossclose(worker->sim);
+            }
+            break;
+        case 1: {
+            char base_name[16];
+            snprintf(base_name, sizeof(base_name), "%08"PRIu32, worker->next_index++);
+            if ((r & 1u) == 0u) {
+                inject_deleted_handle_write(worker->sim, base_name);
+            } else {
+                inject_recreated_path_stale_close(worker->sim, base_name);
+            }
+            break;
+        }
+        case 2:
+            inject_multi_pwr_stale_batch(worker->sim, worker->next_index);
+            worker->next_index += 3u;
+            break;
+        default:
+            inject_dual_idx_handle_crossclose(worker->sim);
+            inject_multi_pwr_stale_batch(worker->sim, worker->next_index);
+            worker->next_index += 3u;
+            break;
+        }
+
+        if ((r % 5u) == 0u) {
+            g_flash_fault_injection_start = 0;
+            g_flash_fault_injection_enabled = 0;
+        }
+        sleep_ms(1u + (unsigned)(r % 7u));
+    }
+
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 static const char *lschk_status_name(lschk_status_t status) {
     switch (status) {
     case LSCHK_STATUS_REAL:
@@ -1627,8 +2188,10 @@ static int collect_lschk_entries(
 
     for (size_t i = 0; i < count; i++) {
         lfs_debug_entry_t probe;
-        err = lfs_debug_probeentry(&sim->lfs, path, entries[i].id, &probe);
+        err = lfs_debug_probeentryat(&sim->lfs, entries[i].pair,
+                entries[i].id, &probe);
         if (err) {
+            entries[i].probe_failed = true;
             entries[i].status = LSCHK_STATUS_DAMAGED;
             continue;
         }
@@ -1646,13 +2209,7 @@ static int collect_lschk_entries(
         }
         entries[i].size = probe.size;
 
-        if (!probe.has_struct) {
-            entries[i].status = LSCHK_STATUS_GHOST;
-        } else if (!probe.data_valid) {
-            entries[i].status = LSCHK_STATUS_DAMAGED;
-        } else {
-            entries[i].status = LSCHK_STATUS_REAL;
-        }
+        entries[i].status = LSCHK_STATUS_REAL;
     }
 
     for (size_t i = 0; i < count; i++) {
@@ -1726,13 +2283,15 @@ static int collect_lschk_entries(
             }
 
             processed[j] = true;
-            if (entries[j].status == LSCHK_STATUS_GHOST ||
-                    entries[j].status == LSCHK_STATUS_DAMAGED) {
-                continue;
-            }
 
             if (!winner_found) {
-                entries[j].status = LSCHK_STATUS_DAMAGED;
+                if (entries[j].probe_failed || !entries[j].has_struct) {
+                    entries[j].status = LSCHK_STATUS_GHOST;
+                } else if (!entries[j].data_valid) {
+                    entries[j].status = LSCHK_STATUS_DAMAGED;
+                } else {
+                    entries[j].status = LSCHK_STATUS_DAMAGED;
+                }
                 continue;
             }
 
@@ -1887,7 +2446,8 @@ static int cmd_lsrepair_common(sim_state_t *sim, int argc, char **argv,
         lschk_entry_t victim = entries[target_index];
         free(entries);
 
-        int remove_err = lfs_debug_removeghost(&sim->lfs, path, victim.name, victim.id);
+        int remove_err = lfs_debug_removeghostat(&sim->lfs, path,
+                victim.pair, victim.name, victim.id);
         if (remove_err) {
             printf("fail  %s [%s] id=%u : %d\n",
                     victim.name,
@@ -3308,6 +3868,689 @@ cleanup:
     return err;
 }
 
+static int cmd_idxstress(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: idxstress <count> [output-file]\n");
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "idxstress: invalid count %s\n", argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], target_dir, output_path, sizeof(output_path));
+        log_file = fopen(output_path, "wb");
+        if (!log_file) {
+            fprintf(stderr, "idxstress: failed to open %s\n", output_path);
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0) {
+            fprintf(stderr, "idxstress: failed to duplicate stdio\n");
+            if (saved_stdout >= 0) {
+                close(saved_stdout);
+            }
+            if (saved_stderr >= 0) {
+                close(saved_stderr);
+            }
+            fclose(log_file);
+            return -1;
+        }
+
+        if (dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            fprintf(stderr, "idxstress: failed to redirect output\n");
+            close(saved_stdout);
+            close(saved_stderr);
+            fclose(log_file);
+            return -1;
+        }
+        printf("idxstress log path: %s\n", output_path);
+    }
+
+    struct lfs_info info;
+    int err = 0;
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) {
+                goto cleanup;
+            }
+        }
+    }
+
+    err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        goto cleanup;
+    }
+
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+
+    for (lfs_size_t iteration = 0; iteration < count; iteration++) {
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+            err = run_internal_command(sim, "create PWR.IDX");
+            if (err) {
+                goto cleanup;
+            }
+        } else {
+            run_internal_command(sim, "read PWR.IDX");
+        }
+
+        size_t pwr_count = 0;
+        bool have_any = false;
+        uint32_t min_index = 0;
+        uint32_t max_index = 0;
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "idxstress: scan failed: %d\n", err);
+            goto cleanup;
+        }
+
+        if (pwr_count < 4 || ((rand() % 4) == 0 && pwr_count < 6)) {
+            uint32_t next_index = have_any ? (max_index + 1u) : 0u;
+            char base_name[16];
+            char new_name[32];
+            snprintf(base_name, sizeof(base_name), "%08"PRIu32, next_index);
+            snprintf(new_name, sizeof(new_name), "%s.PWR", base_name);
+            if ((rand() % 5) == 0) {
+                inject_deleted_handle_write(sim, base_name);
+            } else {
+                run_internal_command(sim, "create %s", new_name);
+                run_internal_command(sim, "write %s 1024 --append", new_name);
+            }
+            g_flash_fault_injection_start = 0;
+            g_flash_fault_injection_enabled = 0;
+            err = statfailtest_checkpoint(sim, iteration, "pwr-maintain");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+        }
+
+        int rename_loops = 18 + (rand() % 15);
+        for (int step = 0; step < rename_loops; step++) {
+            if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
+                run_internal_command(sim, "rm PWR.IDX.tmp");
+            }
+
+            g_flash_fault_injection_start = 1;
+            sleep_ms(80u + (unsigned)(rand() % 121));
+            run_internal_command(sim, "create PWR.IDX.tmp");
+            err = statfailtest_checkpoint(sim, iteration, "idx-tmp-create");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+
+            run_internal_command(sim, "write PWR.IDX.tmp 988");
+            err = statfailtest_checkpoint(sim, iteration, "idx-tmp-write");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+
+            if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) == 0) {
+                if ((step % 3) == 0) {
+                    run_internal_command(sim, "read PWR.IDX");
+                }
+                run_internal_command(sim, "rm PWR.IDX");
+                err = statfailtest_checkpoint(sim, iteration, "idx-remove");
+                if (err) {
+                    if (err > 0) {
+                        err = 0;
+                    }
+                    goto cleanup;
+                }
+            }
+
+            run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+            g_flash_fault_injection_start = 0;
+            g_flash_fault_injection_enabled = 0;
+            err = statfailtest_checkpoint(sim, iteration, "idx-rename");
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+
+            if ((step % 5) == 0) {
+                run_internal_command(sim, "read PWR.IDX");
+            }
+        }
+
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "idxstress: rescan failed: %d\n", err);
+            goto cleanup;
+        }
+
+        while (pwr_count > 5 && have_any) {
+            char oldest_name[32];
+            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+            run_internal_command(sim, "rm %s", oldest_name);
+            err = scan_pwr_files(sim, sim->current_path,
+                    &pwr_count, &have_any, &min_index, &max_index);
+            if (err) {
+                fprintf(stderr, "idxstress: rescan after cleanup failed: %d\n", err);
+                goto cleanup;
+            }
+        }
+
+        err = statfailtest_checkpoint(sim, iteration, "iteration-end");
+        if (err) {
+            if (err > 0) {
+                err = 0;
+            }
+            goto cleanup;
+        }
+
+        if (log_file) {
+            emit_progress_tick(saved_stdout);
+        }
+    }
+
+    printf("idxstress completed: %"PRIu32" iterations, no visible/stat mismatch found\n",
+            (uint32_t)count);
+    err = 0;
+
+cleanup:
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("idxstress output saved to %s\n", output_path);
+    }
+    return err;
+}
+
+static int cmd_chaosstress_common(sim_state_t *sim, int argc, char **argv,
+        bool stop_on_nonreal, const char *display_name) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: %s <count> [output-file]\n", display_name);
+        return -1;
+    }
+
+    lfs_size_t count = 0;
+    if (parse_size_arg(argv[1], &count) || count == 0) {
+        fprintf(stderr, "%s: invalid count %s\n", display_name, argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], target_dir, output_path, sizeof(output_path));
+        log_file = fopen(output_path, "wb");
+        if (!log_file) {
+            fprintf(stderr, "chaosstress: failed to open %s\n", output_path);
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0) {
+            fprintf(stderr, "chaosstress: failed to duplicate stdio\n");
+            if (saved_stdout >= 0) {
+                close(saved_stdout);
+            }
+            if (saved_stderr >= 0) {
+                close(saved_stderr);
+            }
+            fclose(log_file);
+            return -1;
+        }
+
+        if (dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            fprintf(stderr, "chaosstress: failed to redirect output\n");
+            close(saved_stdout);
+            close(saved_stderr);
+            fclose(log_file);
+            return -1;
+        }
+        printf("chaosstress log path: %s\n", output_path);
+    }
+
+    struct lfs_info info;
+    int err = 0;
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) {
+                goto cleanup;
+            }
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) {
+                goto cleanup;
+            }
+        }
+    }
+
+    err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        goto cleanup;
+    }
+
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+
+    bool periodic_remount = !stop_on_nonreal;
+
+    for (lfs_size_t iteration = 0; iteration < count; iteration++) {
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+            run_internal_command(sim, "create PWR.IDX");
+            run_internal_command(sim, "write PWR.IDX 988 --append");
+        }
+
+        size_t pwr_count = 0;
+        bool have_any = false;
+        uint32_t min_index = 0;
+        uint32_t max_index = 0;
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "chaosstress: scan failed: %d\n", err);
+            goto cleanup;
+        }
+
+        if (pwr_count < 6) {
+            uint32_t next_index = have_any ? (max_index + 1u) : 0u;
+            char base_name[16];
+            char new_name[32];
+            snprintf(base_name, sizeof(base_name), "%08"PRIu32, next_index);
+            snprintf(new_name, sizeof(new_name), "%s.PWR", base_name);
+            run_internal_command(sim, "create %s", new_name);
+            run_internal_command(sim, "write %s 2048 --append", new_name);
+        }
+
+        int idx_loops = 10 + (rand() % 10);
+        for (int step = 0; step < idx_loops; step++) {
+            g_flash_fault_injection_start = 1;
+            sleep_ms(15u + (unsigned)(rand() % 36));
+
+            if ((step % 3) == 0) {
+                inject_idx_rename_recreate_handle(sim);
+                err = idxstress_checkpoint(sim, iteration, "idx-rename-open-handle", false,
+                        stop_on_nonreal);
+            } else if ((step % 3) == 1) {
+                inject_dual_idx_handle_crossclose(sim);
+                err = idxstress_checkpoint(sim, iteration, "idx-dual-handle-crossclose", false,
+                        stop_on_nonreal);
+            } else {
+                if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX.tmp", &info) == 0) {
+                    run_internal_command(sim, "rm PWR.IDX.tmp");
+                }
+                run_internal_command(sim, "create PWR.IDX.tmp");
+                err = idxstress_checkpoint(sim, iteration, "idx-tmp-create", true,
+                        stop_on_nonreal);
+                if (err) {
+                    if (err > 0) {
+                        err = 0;
+                    }
+                    goto cleanup;
+                }
+                run_internal_command(sim, "write PWR.IDX.tmp 988");
+                if ((rand() % 3) == 0) {
+                    run_internal_command(sim, "read PWR.IDX");
+                }
+                run_internal_command(sim, "rm PWR.IDX");
+                run_internal_command(sim, "rename PWR.IDX.tmp PWR.IDX");
+                err = idxstress_checkpoint(sim, iteration, "idx-normal-rename", false,
+                        stop_on_nonreal);
+            }
+
+            g_flash_fault_injection_start = 0;
+            g_flash_fault_injection_enabled = 0;
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+
+            if ((rand() % 2) == 0) {
+                uint32_t base = have_any ? min_index + (uint32_t)(rand() % ((max_index - min_index) + 1u)) : 0u;
+                char base_name[16];
+                snprintf(base_name, sizeof(base_name), "%08"PRIu32, base);
+                if ((rand() % 2) == 0) {
+                    inject_deleted_handle_write(sim, base_name);
+                    err = idxstress_checkpoint(sim, iteration, "deleted-handle-write", false,
+                            stop_on_nonreal);
+                } else {
+                    inject_recreated_path_stale_close(sim, base_name);
+                    err = idxstress_checkpoint(sim, iteration, "recreated-path-close", false,
+                            stop_on_nonreal);
+                }
+                if (err) {
+                    if (err > 0) {
+                        err = 0;
+                    }
+                    goto cleanup;
+                }
+            }
+
+            if ((rand() % 3) == 0) {
+                uint32_t start_index = have_any ? (max_index + 1u) : 0u;
+                inject_multi_pwr_stale_batch(sim, start_index);
+                err = idxstress_checkpoint(sim, iteration, "multi-stale-batch", false,
+                        stop_on_nonreal);
+                if (err) {
+                    if (err > 0) {
+                        err = 0;
+                    }
+                    goto cleanup;
+                }
+            }
+        }
+
+        err = scan_pwr_files(sim, sim->current_path,
+                &pwr_count, &have_any, &min_index, &max_index);
+        if (err) {
+            fprintf(stderr, "chaosstress: rescan failed: %d\n", err);
+            goto cleanup;
+        }
+
+        while (pwr_count > 8 && have_any) {
+            char oldest_name[32];
+            snprintf(oldest_name, sizeof(oldest_name), "%08"PRIu32".PWR", min_index);
+            run_internal_command(sim, "rm %s", oldest_name);
+            err = scan_pwr_files(sim, sim->current_path,
+                    &pwr_count, &have_any, &min_index, &max_index);
+            if (err) {
+                fprintf(stderr, "chaosstress: cleanup scan failed: %d\n", err);
+                goto cleanup;
+            }
+        }
+
+        err = idxstress_checkpoint(sim, iteration, "iteration-end", false,
+                stop_on_nonreal);
+        if (err) {
+            if (err > 0) {
+                err = 0;
+            }
+            goto cleanup;
+        }
+
+        if (log_file) {
+            emit_progress_tick(saved_stdout);
+        }
+
+        if (periodic_remount && (((iteration + 1u) % 25u) == 0u)) {
+            printf("%s remount checkpoint at iteration %"PRIu32"\n",
+                    display_name, (uint32_t)(iteration + 1u));
+            err = sim_unmount(sim);
+            if (err) {
+                fprintf(stderr, "%s: unmount failed during remount checkpoint: %d\n",
+                        display_name, err);
+                goto cleanup;
+            }
+
+            err = sim_mount(sim);
+            if (err) {
+                fprintf(stderr, "%s: remount failed at iteration %"PRIu32": %d\n",
+                        display_name, (uint32_t)(iteration + 1u), err);
+                goto cleanup;
+            }
+
+            err = idxstress_checkpoint(sim, iteration, "post-remount", false,
+                    stop_on_nonreal);
+            if (err) {
+                if (err > 0) {
+                    err = 0;
+                }
+                goto cleanup;
+            }
+        }
+    }
+
+    printf("%s completed: %"PRIu32" iterations, no candidate anomaly found\n",
+            display_name, (uint32_t)count);
+    err = 0;
+
+cleanup:
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("%s output saved to %s\n", display_name, output_path);
+    }
+    return err;
+}
+
+static int cmd_chaosstress(sim_state_t *sim, int argc, char **argv) {
+    return cmd_chaosstress_common(sim, argc, argv, true, "chaosstress");
+}
+
+static int cmd_chaosstressdeep(sim_state_t *sim, int argc, char **argv) {
+    return cmd_chaosstress_common(sim, argc, argv, false, "chaosstressdeep");
+}
+
+static int cmd_chaosrace(sim_state_t *sim, int argc, char **argv) {
+    if (ensure_mounted(sim) || argc < 2) {
+        fprintf(stderr, "usage: chaosrace <seconds> [output-file]\n");
+        return -1;
+    }
+
+    lfs_size_t seconds = 0;
+    if (parse_size_arg(argv[1], &seconds) || seconds == 0) {
+        fprintf(stderr, "chaosrace: invalid seconds %s\n", argv[1]);
+        return -1;
+    }
+
+    const char *target_dir = "/lfs0/LOG/PWR";
+    FILE *log_file = NULL;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    char output_path[SIM_PATH_MAX] = {0};
+    struct lfs_info info;
+    int err = 0;
+
+    if (argc >= 3) {
+        resolve_export_path(argv[2], target_dir, output_path, sizeof(output_path));
+        log_file = fopen(output_path, "wb");
+        if (!log_file) {
+            fprintf(stderr, "chaosrace: failed to open %s\n", output_path);
+            return -1;
+        }
+
+        fflush(stdout);
+        fflush(stderr);
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        if (saved_stdout < 0 || saved_stderr < 0) {
+            fprintf(stderr, "chaosrace: failed to duplicate stdio\n");
+            if (saved_stdout >= 0) close(saved_stdout);
+            if (saved_stderr >= 0) close(saved_stderr);
+            fclose(log_file);
+            return -1;
+        }
+
+        if (dup2(fileno(log_file), fileno(stdout)) < 0 ||
+                dup2(fileno(log_file), fileno(stderr)) < 0) {
+            fprintf(stderr, "chaosrace: failed to redirect output\n");
+            close(saved_stdout);
+            close(saved_stderr);
+            fclose(log_file);
+            return -1;
+        }
+        printf("chaosrace log path: %s\n", output_path);
+    }
+
+    if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+        if (lfs_stat(&sim->lfs, "/lfs0", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0");
+            if (err) goto cleanup;
+        }
+        if (lfs_stat(&sim->lfs, "/lfs0/LOG", &info) < 0) {
+            err = run_internal_command(sim, "mkdir /lfs0/LOG");
+            if (err) goto cleanup;
+        }
+        if (lfs_stat(&sim->lfs, target_dir, &info) < 0) {
+            err = run_internal_command(sim, "mkdir %s", target_dir);
+            if (err) goto cleanup;
+        }
+    }
+
+    err = run_internal_command(sim, "cd %s", target_dir);
+    if (err) {
+        goto cleanup;
+    }
+
+    if (lfs_stat(&sim->lfs, "/lfs0/LOG/PWR/PWR.IDX", &info) < 0) {
+        run_internal_command(sim, "create PWR.IDX");
+        run_internal_command(sim, "write PWR.IDX 988 --append");
+    }
+
+    for (uint32_t i = 0; i < 6u; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "%08"PRIu32".PWR", i);
+        run_internal_command(sim, "create %s", name);
+        run_internal_command(sim, "write %s 1024 --append", name);
+    }
+
+    volatile int stop = 0;
+    chaosrace_worker_t workers[4];
+    memset(workers, 0, sizeof(workers));
+
+#ifdef _WIN32
+    HANDLE threads[4] = {0};
+#else
+    pthread_t threads[4];
+    memset(threads, 0, sizeof(threads));
+#endif
+
+    for (int i = 0; i < 4; i++) {
+        workers[i].sim = sim;
+        workers[i].stop = &stop;
+        workers[i].seed = (uint32_t)time(NULL) ^ (0x9e3779b9u * (uint32_t)(i + 1));
+        workers[i].next_index = 100000u + (uint32_t)(i * 1000);
+        workers[i].role = i;
+#ifdef _WIN32
+        threads[i] = CreateThread(NULL, 0, chaosrace_worker_thread, &workers[i], 0, NULL);
+#else
+        pthread_create(&threads[i], NULL, chaosrace_worker_thread, &workers[i]);
+#endif
+    }
+
+    time_t deadline = time(NULL) + (time_t)seconds;
+    uint32_t checkpoint = 0;
+    while (time(NULL) < deadline) {
+        sleep_ms(200u);
+        checkpoint++;
+        err = idxstress_checkpoint(sim, checkpoint, "chaosrace-monitor", false, false);
+        if (err) {
+            if (err > 0) {
+                err = 0;
+            }
+            break;
+        }
+
+        if ((checkpoint % 5u) == 0u) {
+            flush_device_to_image(sim);
+            if (log_file) {
+                emit_progress_tick(saved_stdout);
+            }
+        }
+    }
+
+    stop = 1;
+#ifdef _WIN32
+    for (int i = 0; i < 4; i++) {
+        if (threads[i]) {
+            WaitForSingleObject(threads[i], 30000);
+            CloseHandle(threads[i]);
+        }
+    }
+#else
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+#endif
+
+    flush_device_to_image(sim);
+    run_internal_command(sim, "lschk .");
+    run_internal_command(sim, "meta-dump . --export chaosrace_final_meta.txt");
+    printf("chaosrace completed: %"PRIu32" seconds\n", (uint32_t)seconds);
+    err = 0;
+
+cleanup:
+    stop = 1;
+    g_flash_fault_injection_start = 0;
+    g_flash_fault_injection_enabled = 0;
+    if (log_file) {
+        fflush(stdout);
+        fflush(stderr);
+        dup2(saved_stdout, fileno(stdout));
+        dup2(saved_stderr, fileno(stderr));
+        close(saved_stdout);
+        close(saved_stderr);
+        fclose(log_file);
+        printf("chaosrace output saved to %s\n", output_path);
+    }
+    return err;
+}
+
 static int cmd_mkdir(sim_state_t *sim, int argc, char **argv) {
     if (ensure_mounted(sim) || argc < 2) {
         fprintf(stderr, "usage: mkdir <dir>\n");
@@ -4029,6 +5272,18 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "statfailtest") == 0) {
         return cmd_statfailtest(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "idxstress") == 0) {
+        return cmd_idxstress(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "chaosstress") == 0) {
+        return cmd_chaosstress(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "chaosstressdeep") == 0) {
+        return cmd_chaosstressdeep(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "chaosrace") == 0) {
+        return cmd_chaosrace(sim, argc, argv);
     }
     if (strcmp(argv[0], "mkdir") == 0) {
         return cmd_mkdir(sim, argc, argv);

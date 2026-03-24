@@ -495,6 +495,13 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 // fails if the requested id currently resolves as the normal path target.
 int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
         const char *name, uint16_t id);
+
+// Removes a specific ghost entry by exact metadata pair and id.
+//
+// This variant is intended for split-directory repair workflows where ids are
+// local to a specific metadata pair.
+int lfs_debug_removeghostat(lfs_t *lfs, const char *dirpath,
+        const lfs_block_t pair[2], const char *name, uint16_t id);
 #endif
 
 // Probes a directory entry by exact directory path and id.
@@ -505,6 +512,13 @@ int lfs_debug_removeghost(lfs_t *lfs, const char *dirpath,
 //
 // Returns a negative error code on failure.
 int lfs_debug_probeentry(lfs_t *lfs, const char *dirpath,
+        uint16_t id, lfs_debug_entry_t *entry);
+
+// Probes a directory entry by exact metadata pair and id.
+//
+// This variant is intended for split-directory workflows where ids are local
+// to a specific metadata pair.
+int lfs_debug_probeentryat(lfs_t *lfs, const lfs_block_t pair[2],
         uint16_t id, lfs_debug_entry_t *entry);
 
 // Find info about a file or directory
