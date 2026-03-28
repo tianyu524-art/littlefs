@@ -1513,16 +1513,35 @@ static int cmd_ls(sim_state_t *sim, int argc, char **argv) {
     }
 
     printf("Listing %s\n", path);
-    printf("%-6s %-10s %s\n", "TYPE", "SIZE", "NAME");
+    printf("%-6s %-10s %-20s %-20s %s\n", "TYPE", "SIZE", "CTIME", "MTIME", "NAME");
 
     struct lfs_info info;
     while ((err = lfs_dir_read(&sim->lfs, &dir, &info)) > 0) {
         if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
             continue;
         }
-        printf("%-6s %-10"PRIu32" %s\n",
+
+        // format timestamps
+        char ctime_str[24] = "-";
+        char mtime_str[24] = "-";
+
+        if (info.ctime > 0) {
+            time_t t = (time_t)info.ctime;
+            struct tm *tm_info = localtime(&t);
+            strftime(ctime_str, sizeof(ctime_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        }
+
+        if (info.mtime > 0) {
+            time_t t = (time_t)info.mtime;
+            struct tm *tm_info = localtime(&t);
+            strftime(mtime_str, sizeof(mtime_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        }
+
+        printf("%-6s %-10"PRIu32" %-20s %-20s %s\n",
                 (info.type == LFS_TYPE_DIR) ? "DIR" : "FILE",
                 (uint32_t)info.size,
+                ctime_str,
+                mtime_str,
                 info.name);
     }
 

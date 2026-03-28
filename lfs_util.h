@@ -189,6 +189,34 @@ static inline uint32_t lfs_tole32(uint32_t a) {
     return lfs_fromle32(a);
 }
 
+// Convert between 64-bit little-endian and native order
+static inline uint64_t lfs_fromle64(uint64_t a) {
+#if !defined(LFS_NO_INTRINSICS) && ( \
+    (defined(  BYTE_ORDER  ) && defined(  ORDER_LITTLE_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_LITTLE_ENDIAN  ) || \
+    (defined(__BYTE_ORDER  ) && defined(__ORDER_LITTLE_ENDIAN  ) && __BYTE_ORDER   == __ORDER_LITTLE_ENDIAN  ) || \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    return a;
+#elif !defined(LFS_NO_INTRINSICS) && ( \
+    (defined(  BYTE_ORDER  ) && defined(  ORDER_BIG_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_BIG_ENDIAN  ) || \
+    (defined(__BYTE_ORDER  ) && defined(__ORDER_BIG_ENDIAN  ) && __BYTE_ORDER   == __ORDER_BIG_ENDIAN  ) || \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
+    return __builtin_bswap64(a);
+#else
+    return (((uint8_t*)&a)[0] <<  0) |
+           (((uint8_t*)&a)[1] <<  8) |
+           (((uint8_t*)&a)[2] << 16) |
+           (((uint8_t*)&a)[3] << 24) |
+           (((uint8_t*)&a)[4] << 32) |
+           (((uint8_t*)&a)[5] << 40) |
+           (((uint8_t*)&a)[6] << 48) |
+           (((uint8_t*)&a)[7] << 56);
+#endif
+}
+
+static inline uint64_t lfs_tole64(uint64_t a) {
+    return lfs_fromle64(a);
+}
+
 // Convert between 32-bit big-endian and native order
 static inline uint32_t lfs_frombe32(uint32_t a) {
 #if !defined(LFS_NO_INTRINSICS) && ( \

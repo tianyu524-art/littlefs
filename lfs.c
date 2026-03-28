@@ -7,6 +7,19 @@
  */
 #include "lfs.h"
 #include "lfs_util.h"
+#include <time.h>  // for timestamp support
+
+
+/// Timestamp helper functions ///
+
+// Get current timestamp (Unix timestamp in seconds)
+static uint64_t lfs_get_timestamp(void) {
+    return (uint64_t)time(NULL);
+}
+
+// Forward declaration for timestamp reading (defined after lfs_dir_get)
+static int lfs_read_timestamps(lfs_t *lfs, lfs_mdir_t *dir,
+        uint16_t id, uint64_t *ctime, uint64_t *mtime);
 
 
 // some constants used throughout the code
@@ -671,6 +684,33 @@ static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
             0, buffer, lfs_tag_size(gtag));
 }
 
+// Read timestamp attributes from flash (implementation after lfs_dir_get)
+static int lfs_read_timestamps(lfs_t *lfs, lfs_mdir_t *dir,
+        uint16_t id, uint64_t *ctime, uint64_t *mtime) {
+    *ctime = 0;
+    *mtime = 0;
+
+    // read ctime (0x301)
+    lfs_stag_t tag = lfs_dir_get(lfs, dir,
+            LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + 0x01, id, sizeof(uint64_t)),
+            ctime);
+    if (tag >= 0) {
+        *ctime = lfs_fromle64(*ctime);
+    }
+
+    // read mtime (0x302)
+    tag = lfs_dir_get(lfs, dir,
+            LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + 0x02, id, sizeof(uint64_t)),
+            mtime);
+    if (tag >= 0) {
+        *mtime = lfs_fromle64(*mtime);
+    }
+
+    return 0;
+}
+
 static int lfs_dir_getread(lfs_t *lfs, const lfs_mdir_t *dir,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_tag_t gmask, lfs_tag_t gtag,
@@ -1286,6 +1326,9 @@ static int lfs_dir_getinfo(lfs_t *lfs, lfs_mdir_t *dir,
     } else if (lfs_tag_type3(tag) == LFS_TYPE_INLINESTRUCT) {
         info->size = lfs_tag_size(tag);
     }
+
+    // read timestamps
+    lfs_read_timestamps(lfs, dir, id, &info->ctime, &info->mtime);
 
     return 0;
 }
@@ -2472,11 +2515,18 @@ static int lfs_rawmkdir(lfs_t *lfs, const char *path) {
     }
 
     // now insert into our parent block
+    // set timestamps for new directory
+    uint64_t now = lfs_get_timestamp();
+    uint64_t le_ctime = lfs_tole64(now);
+    uint64_t le_mtime = lfs_tole64(now);
+
     lfs_pair_tole32(dir.pair);
     err = lfs_dir_commit(lfs, &cwd.m, LFS_MKATTRS(
             {LFS_MKTAG(LFS_TYPE_CREATE, id, 0), NULL},
             {LFS_MKTAG(LFS_TYPE_DIR, id, nlen), path},
             {LFS_MKTAG(LFS_TYPE_DIRSTRUCT, id, 8), dir.pair},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + 0x01, id, sizeof(uint64_t)), &le_ctime},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + 0x02, id, sizeof(uint64_t)), &le_mtime},
             {LFS_MKTAG_IF(!cwd.m.split,
                 LFS_TYPE_SOFTTAIL, 0x3ff, 8), dir.pair}));
     lfs_pair_fromle32(dir.pair);
@@ -2855,6 +2905,13 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
     file->off = 0;
     file->cache.buffer = NULL;
 
+    // initialize timestamp fields
+    file->path[0] = '\0';
+    file->ctime_dirty = false;
+    file->mtime_dirty = false;
+    file->ctime = 0;
+    file->mtime = 0;
+
     // allocate entry for file if it doesn't exist
     lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
     if (tag < 0 && !(tag == LFS_ERR_NOENT && file->id != 0x3ff)) {
@@ -2884,11 +2941,28 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
             goto cleanup;
         }
 
-        // get next slot and create entry to remember name
+        // set timestamps for new file
+        uint64_t now = lfs_get_timestamp();
+        file->ctime = now;
+        file->mtime = now;
+        file->ctime_dirty = true;
+        file->mtime_dirty = true;
+
+        // save path
+        strncpy(file->path, path, LFS_NAME_MAX);
+        file->path[LFS_NAME_MAX] = '\0';
+
+        // prepare timestamp attributes
+        uint64_t le_ctime = lfs_tole64(now);
+        uint64_t le_mtime = lfs_tole64(now);
+
+        // get next slot and create entry to remember name with timestamps
         err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
                 {LFS_MKTAG(LFS_TYPE_CREATE, file->id, 0), NULL},
                 {LFS_MKTAG(LFS_TYPE_REG, file->id, nlen), path},
-                {LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0), NULL}));
+                {LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0), NULL},
+                {LFS_MKTAG(LFS_TYPE_USERATTR + 0x01, file->id, sizeof(uint64_t)), &le_ctime},
+                {LFS_MKTAG(LFS_TYPE_USERATTR + 0x02, file->id, sizeof(uint64_t)), &le_mtime}));
 
         // it may happen that the file name doesn't fit in the metadata blocks, e.g., a 256 byte file name will
         // not fit in a 128 byte block.
@@ -2910,6 +2984,14 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         // truncate if requested
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0);
         file->flags |= LFS_F_DIRTY;
+        // update mtime for truncation
+        file->mtime = lfs_get_timestamp();
+        file->mtime_dirty = true;
+        // save path and read existing ctime
+        strncpy(file->path, path, LFS_NAME_MAX);
+        file->path[LFS_NAME_MAX] = '\0';
+        lfs_read_timestamps(lfs, &file->m, file->id, &file->ctime, &file->mtime);
+        // mtime will be updated again when file is closed
 #endif
     } else {
         // try to load what's on disk, if it's inlined we'll fix it later
@@ -2920,6 +3002,11 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
             goto cleanup;
         }
         lfs_ctz_fromle32(&file->ctz);
+
+        // save path and read timestamps for existing file
+        strncpy(file->path, path, LFS_NAME_MAX);
+        file->path[LFS_NAME_MAX] = '\0';
+        lfs_read_timestamps(lfs, &file->m, file->id, &file->ctime, &file->mtime);
     }
 
     // fetch attrs
@@ -3238,6 +3325,42 @@ static int lfs_file_rawsync(lfs_t *lfs, lfs_file_t *file) {
         file->flags &= ~LFS_F_DIRTY;
     }
 
+    // write timestamps if dirty
+    if ((file->ctime_dirty || file->mtime_dirty) &&
+            !lfs_pair_isnull(file->m.pair)) {
+        uint64_t le_ctime = lfs_tole64(file->ctime);
+        uint64_t le_mtime = lfs_tole64(file->mtime);
+
+        // build attributes for timestamp commit
+        int attr_count = 0;
+        struct lfs_mattr attrs[2];
+
+        if (file->ctime_dirty) {
+            attrs[attr_count].tag = LFS_MKTAG(LFS_TYPE_USERATTR + 0x01,
+                    file->id, sizeof(uint64_t));
+            attrs[attr_count].buffer = &le_ctime;
+            attr_count++;
+        }
+
+        if (file->mtime_dirty) {
+            attrs[attr_count].tag = LFS_MKTAG(LFS_TYPE_USERATTR + 0x02,
+                    file->id, sizeof(uint64_t));
+            attrs[attr_count].buffer = &le_mtime;
+            attr_count++;
+        }
+
+        if (attr_count > 0) {
+            err = lfs_dir_commit(lfs, &file->m, attrs, attr_count);
+            if (err) {
+                file->flags |= LFS_F_ERRED;
+                return err;
+            }
+        }
+
+        file->ctime_dirty = false;
+        file->mtime_dirty = false;
+    }
+
     return 0;
 }
 #endif
@@ -3413,6 +3536,12 @@ relocate:
 static lfs_ssize_t lfs_file_rawwrite(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
+
+    // update mtime on first write
+    if (!file->mtime_dirty) {
+        file->mtime = lfs_get_timestamp();
+        file->mtime_dirty = true;
+    }
 
     if (file->flags & LFS_F_READING) {
         // drop any reads
@@ -3776,6 +3905,24 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
         lfs_fs_prepmove(lfs, newoldid, oldcwd.pair);
     }
 
+    // read original timestamps
+    uint64_t old_ctime = 0, old_mtime = 0;
+    lfs_read_timestamps(lfs, &oldcwd, lfs_tag_id(oldtag), &old_ctime, &old_mtime);
+
+    // prepare new timestamps
+    uint64_t now = lfs_get_timestamp();
+    uint64_t le_ctime, le_mtime;
+
+    if (lfs_tag_type3(oldtag) == LFS_TYPE_DIR) {
+        // directory: update both ctime and mtime
+        le_ctime = lfs_tole64(now);
+        le_mtime = lfs_tole64(now);
+    } else {
+        // file: update ctime, keep mtime
+        le_ctime = lfs_tole64(now);
+        le_mtime = lfs_tole64(old_mtime);
+    }
+
     // move over all attributes
     err = lfs_dir_commit(lfs, &newcwd, LFS_MKATTRS(
             {LFS_MKTAG_IF(prevtag != LFS_ERR_NOENT,
@@ -3783,6 +3930,8 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
             {LFS_MKTAG(LFS_TYPE_CREATE, newid, 0), NULL},
             {LFS_MKTAG(lfs_tag_type3(oldtag), newid, strlen(newpath)), newpath},
             {LFS_MKTAG(LFS_FROM_MOVE, newid, lfs_tag_id(oldtag)), &oldcwd},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + 0x01, newid, sizeof(uint64_t)), &le_ctime},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + 0x02, newid, sizeof(uint64_t)), &le_mtime},
             {LFS_MKTAG_IF(samepair,
                 LFS_TYPE_DELETE, newoldid, 0), NULL}));
     if (err) {
