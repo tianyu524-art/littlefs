@@ -489,6 +489,10 @@ int lfs_remove(lfs_t *lfs, const char *path);
 // Returns a negative error code on failure.
 int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 
+// Optimized rename path that preserves existing lfs_rename behavior but
+// reduces redundant directory scans and timestamp commits.
+int lfs_rename_opt(lfs_t *lfs, const char *oldpath, const char *newpath);
+
 // Removes a specific ghost entry by directory path, entry name, and id.
 //
 // This is intended for repair workflows. The function is conservative and

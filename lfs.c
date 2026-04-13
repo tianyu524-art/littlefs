@@ -3967,6 +3967,239 @@ static int lfs_rawrename(lfs_t *lfs, const char *oldpath, const char *newpath) {
 }
 #endif
 
+#ifndef LFS_READONLY
+static lfs_ssize_t lfs_dir_getattr_byid(lfs_t *lfs, const lfs_mdir_t *dir,
+        uint16_t id, uint8_t type, void *buffer, lfs_size_t size) {
+    lfs_stag_t tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+                id, lfs_min(size, lfs->attr_max)),
+            buffer);
+    if (tag < 0) {
+        if (tag == LFS_ERR_NOENT) {
+            return LFS_ERR_NOATTR;
+        }
+        return tag;
+    }
+
+    return lfs_tag_size(tag);
+}
+
+static int lfs_name_cmp_inline(const char *left, lfs_size_t left_size,
+        const char *right, lfs_size_t right_size) {
+    lfs_size_t diff = lfs_min(left_size, right_size);
+    int res = memcmp(left, right, diff);
+    if (res != 0) {
+        return (res < 0) ? LFS_CMP_LT : LFS_CMP_GT;
+    }
+
+    if (left_size != right_size) {
+        return (left_size < right_size) ? LFS_CMP_GT : LFS_CMP_LT;
+    }
+
+    return LFS_CMP_EQ;
+}
+
+static bool lfs_path_same_parent(const char *left, const char *right) {
+    const char *left_end = strrchr(left, '/');
+    const char *right_end = strrchr(right, '/');
+    lfs_size_t left_len = left_end ? (lfs_size_t)(left_end - left) : 0;
+    lfs_size_t right_len = right_end ? (lfs_size_t)(right_end - right) : 0;
+
+    if (left_len != right_len) {
+        return false;
+    }
+
+    if (left_len == 0) {
+        return true;
+    }
+
+    return memcmp(left, right, left_len) == 0;
+}
+#endif
+
+#ifndef LFS_READONLY
+static int lfs_rawrename_opt(lfs_t *lfs,
+        const char *oldpath, const char *newpath) {
+    char oldname[LFS_NAME_MAX+1];
+    char newname[LFS_NAME_MAX+1];
+    uint64_t oldmtime = 0;
+    uint64_t current = 0;
+
+    strncpy(oldname, oldpath, sizeof(oldname) - 1);
+    oldname[sizeof(oldname) - 1] = '\0';
+    strncpy(newname, newpath, sizeof(newname) - 1);
+    newname[sizeof(newname) - 1] = '\0';
+
+    int err = lfs_fs_forceconsistency(lfs);
+    if (err) {
+        return err;
+    }
+
+    lfs_mdir_t oldcwd;
+    lfs_stag_t oldtag = lfs_dir_find(lfs, &oldcwd, &oldpath, NULL);
+    if (oldtag < 0 || lfs_tag_id(oldtag) == 0x3ff) {
+        return (oldtag < 0) ? (int)oldtag : LFS_ERR_INVAL;
+    }
+
+    {
+        uint8_t type = 0xff;
+        void *handle = lfs_mlist_find(lfs->mlist, oldname, &type);
+        if (handle && type == LFS_TYPE_REG) {
+            oldmtime = ((lfs_file_t *)handle)->mtime;
+        } else {
+            lfs_ssize_t res = lfs_dir_getattr_byid(lfs, &oldcwd,
+                    lfs_tag_id(oldtag), LFS_ATTR_MTIME,
+                    &oldmtime, sizeof(oldmtime));
+            if (res < 0) {
+                oldmtime = 0;
+            }
+        }
+    }
+    current = lfs_now();
+
+    lfs_mdir_t newcwd;
+    uint16_t newid;
+    lfs_stag_t prevtag;
+    bool samepair;
+    uint16_t newoldid = lfs_tag_id(oldtag);
+
+    if (lfs_path_same_parent(oldname, newname) &&
+            !oldcwd.split &&
+            oldcwd.count == 1 &&
+            newoldid == 0) {
+        newcwd = oldcwd;
+        samepair = true;
+
+        if (strcmp(oldpath, newpath) == 0) {
+            prevtag = oldtag;
+            newid = newoldid;
+        } else {
+            prevtag = LFS_ERR_NOENT;
+            newid = (lfs_name_cmp_inline(newpath, strlen(newpath),
+                    oldpath, strlen(oldpath)) == LFS_CMP_LT)
+                    ? newoldid : (uint16_t)(newoldid + 1);
+        }
+    } else {
+        prevtag = lfs_dir_find(lfs, &newcwd, &newpath, &newid);
+        samepair = (lfs_pair_cmp(oldcwd.pair, newcwd.pair) == 0);
+    }
+
+    if ((prevtag < 0 || lfs_tag_id(prevtag) == 0x3ff) &&
+            !(prevtag == LFS_ERR_NOENT && newid != 0x3ff)) {
+        return (prevtag < 0) ? (int)prevtag : LFS_ERR_INVAL;
+    }
+
+    struct lfs_mlist prevdir;
+    prevdir.next = lfs->mlist;
+    if (prevtag == LFS_ERR_NOENT) {
+        lfs_size_t nlen = strlen(newpath);
+        if (nlen > lfs->name_max) {
+            return LFS_ERR_NAMETOOLONG;
+        }
+
+        if (samepair && newid <= newoldid) {
+            newoldid += 1;
+        }
+    } else if (lfs_tag_type3(prevtag) != lfs_tag_type3(oldtag)) {
+        return LFS_ERR_ISDIR;
+    } else if (samepair && newid == newoldid) {
+        return 0;
+    } else if (lfs_tag_type3(prevtag) == LFS_TYPE_DIR) {
+        lfs_block_t prevpair[2];
+        lfs_stag_t res = lfs_dir_get(lfs, &newcwd, LFS_MKTAG(0x700, 0x3ff, 0),
+                LFS_MKTAG(LFS_TYPE_STRUCT, newid, 8), prevpair);
+        if (res < 0) {
+            return (int)res;
+        }
+        lfs_pair_fromle32(prevpair);
+
+        err = lfs_dir_fetch(lfs, &prevdir.m, prevpair);
+        if (err) {
+            return err;
+        }
+
+        if (prevdir.m.count > 0 || prevdir.m.split) {
+            return LFS_ERR_NOTEMPTY;
+        }
+
+        err = lfs_fs_preporphans(lfs, +1);
+        if (err) {
+            return err;
+        }
+
+        prevdir.type = 0;
+        prevdir.id = 0;
+        lfs->mlist = &prevdir;
+    }
+
+    if (!samepair) {
+        lfs_fs_prepmove(lfs, newoldid, oldcwd.pair);
+    }
+
+    err = lfs_dir_commit(lfs, &newcwd, LFS_MKATTRS(
+            {LFS_MKTAG_IF(prevtag != LFS_ERR_NOENT,
+                LFS_TYPE_DELETE, newid, 0), NULL},
+            {LFS_MKTAG(LFS_TYPE_CREATE, newid, 0), NULL},
+            {LFS_MKTAG(lfs_tag_type3(oldtag), newid, strlen(newpath)), newpath},
+            {LFS_MKTAG(LFS_FROM_MOVE, newid, lfs_tag_id(oldtag)), &oldcwd},
+            {LFS_MKTAG_IF(samepair,
+                LFS_TYPE_DELETE, newoldid, 0), NULL},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + LFS_ATTR_MTIME,
+                newid, sizeof(oldmtime)), &oldmtime},
+            {LFS_MKTAG(LFS_TYPE_USERATTR + LFS_ATTR_CTIME,
+                newid, sizeof(current)), &current}));
+    if (err) {
+        lfs->mlist = prevdir.next;
+        return err;
+    }
+
+    if (!samepair && lfs_gstate_hasmove(&lfs->gstate)) {
+        lfs_fs_prepmove(lfs, 0x3ff, NULL);
+        err = lfs_dir_commit(lfs, &oldcwd, LFS_MKATTRS(
+                {LFS_MKTAG(LFS_TYPE_DELETE, lfs_tag_id(oldtag), 0), NULL}));
+        if (err) {
+            lfs->mlist = prevdir.next;
+            return err;
+        }
+    }
+
+    lfs->mlist = prevdir.next;
+    if (prevtag != LFS_ERR_NOENT &&
+            lfs_tag_type3(prevtag) == LFS_TYPE_DIR) {
+        err = lfs_fs_preporphans(lfs, -1);
+        if (err) {
+            return err;
+        }
+
+        err = lfs_fs_pred(lfs, prevdir.m.pair, &newcwd);
+        if (err) {
+            return err;
+        }
+
+        err = lfs_dir_drop(lfs, &newcwd, &prevdir.m);
+        if (err) {
+            return err;
+        }
+    }
+
+    {
+        uint8_t type = 0xff;
+        void *handle = lfs_mlist_find(lfs->mlist, oldname, &type);
+        if (handle && type == LFS_TYPE_REG) {
+            lfs_file_t *file = handle;
+            file->mtime = oldmtime;
+            file->ctime = current;
+            file->mtimeflag = false;
+            file->ctimeflag = false;
+            strncpy(file->path, newname, sizeof(file->path) - 1);
+            file->path[sizeof(file->path) - 1] = '\0';
+        }
+    }
+
+    return 0;
+}
+#endif
+
 static lfs_ssize_t lfs_rawgetattr(lfs_t *lfs, const char *path,
         uint8_t type, void *buffer, lfs_size_t size) {
     lfs_mdir_t cwd;
@@ -5813,6 +6046,23 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath) {
     err = lfs_rawrename(lfs, oldpath, newpath);
 
     LFS_TRACE("lfs_rename -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_rename_opt(lfs_t *lfs, const char *oldpath, const char *newpath) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_rename_opt(%p, \"%s\", \"%s\")",
+            (void*)lfs, oldpath, newpath);
+
+    err = lfs_rawrename_opt(lfs, oldpath, newpath);
+
+    LFS_TRACE("lfs_rename_opt -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }
