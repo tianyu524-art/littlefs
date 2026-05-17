@@ -140,6 +140,12 @@ typedef struct chaosrace_worker {
 
 static char g_exe_dir[SIM_PATH_MAX];
 
+/* When non-zero, sim_mount runs a recursive duplicate-name scan immediately
+ * after a successful lfs_mount. Toggle via the `lschk-on-mount` shell command.
+ * Defaults to off so existing scripts keep their old behavior.
+ */
+static int g_lschk_on_mount = 0;
+
 static void print_help(void);
 static int parse_cli(int argc, char **argv, cli_options_t *options);
 static void detect_executable_dir(
@@ -272,6 +278,10 @@ static int build_child_path(
         const char *dir_path, const char *name, char *buffer, size_t buffer_size);
 static int collect_lschk_entries(
         sim_state_t *sim, const char *path, lschk_entry_t **entries_out, size_t *count_out);
+static int sim_scan_dups_recursive(sim_state_t *sim, const char *path,
+        size_t *dups_out, size_t *dirs_out, int depth, bool verbose);
+static int sim_scan_after_mount(sim_state_t *sim, bool verbose);
+static int cmd_lschk_on_mount(sim_state_t *sim, int argc, char **argv);
 static void build_default_meta_dump_name(
         const char *path, char *buffer, size_t buffer_size);
 static void resolve_export_path(
@@ -434,6 +444,10 @@ static void print_help(void) {
     printf("  format\n");
     printf("  mount\n");
     printf("  umount\n");
+    printf("  dual-handle               # inject_dual_idx_handle_crossclose (debug)\n");
+    printf("  stale-rename              # inject_idx_rename_recreate_handle (debug)\n");
+    printf("  lschk-on-mount [on|off|now|status]\n");
+    printf("                            # toggle / run recursive duplicate-name scan after mount\n");
     printf("  help\n");
     printf("  quit\n");
 }
@@ -1034,7 +1048,18 @@ static int sim_mount(sim_state_t *sim) {
     sim->mounted = true;
     strcpy(sim->current_path, "/lfs0/LOG/PWR");
     printf("Filesystem mounted.\n");
-    return sim_prepare_default_pwd(sim);
+    int pwd_err = sim_prepare_default_pwd(sim);
+    if (pwd_err) {
+        return pwd_err;
+    }
+    /* Opt-in: walk the whole tree once and flag duplicate names. We do this
+     * after the default pwd is set so the scan succeeds even on a freshly
+     * formatted image whose /lfs0/LOG/PWR was just created.
+     */
+    if (g_lschk_on_mount) {
+        (void)sim_scan_after_mount(sim, true);
+    }
+    return 0;
 }
 
 static int sim_unmount(sim_state_t *sim) {
@@ -2326,6 +2351,146 @@ static int collect_lschk_entries(
     *entries_out = entries;
     *count_out = count;
     return 0;
+}
+
+/* Recursively walk the directory tree rooted at `path` and count entries
+ * that share a name with at least one other entry in the same directory.
+ * `dups_out` accumulates the duplicate count across the whole subtree;
+ * `dirs_out` counts how many directories were inspected.
+ *
+ * Returns 0 on success, or a negative lfs error code. Recursion depth is
+ * capped at 32 to defend against pathological state.
+ */
+static int sim_scan_dups_recursive(sim_state_t *sim, const char *path,
+        size_t *dups_out, size_t *dirs_out, int depth,
+        bool verbose) {
+    if (depth > 32) {
+        fprintf(stderr, "lschk-on-mount: depth limit reached at %s\n", path);
+        return 0;
+    }
+
+    lschk_entry_t *entries = NULL;
+    size_t count = 0;
+    int err = collect_lschk_entries(sim, path, &entries, &count);
+    if (err) {
+        return err;
+    }
+
+    *dirs_out += 1;
+
+    /* Count duplicate-name entries inside this directory.
+     * collect_lschk_entries already flagged them via entries[i].duplicate.
+     */
+    size_t local_dups = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].duplicate) {
+            local_dups++;
+        }
+    }
+    if (local_dups > 0) {
+        *dups_out += local_dups;
+        if (verbose) {
+            printf("[lschk-on-mount] %s: %zu duplicate-name entries\n",
+                    path, local_dups);
+            for (size_t i = 0; i < count; i++) {
+                if (entries[i].duplicate) {
+                    const char *status =
+                            (entries[i].status == LSCHK_STATUS_REAL)   ? "realfile" :
+                            (entries[i].status == LSCHK_STATUS_GHOST)  ? "ghost"    :
+                                                                          "damaged";
+                    printf("    id=%u type=%s size=%"PRIu32" name=%s [%s]\n",
+                            (unsigned)entries[i].id,
+                            (entries[i].type == LFS_TYPE_DIR) ? "DIR" : "FILE",
+                            (uint32_t)entries[i].size,
+                            entries[i].name,
+                            status);
+                }
+            }
+        }
+    }
+
+    /* Recurse into subdirectories. Build the child path before freeing
+     * `entries`, since the entry names are owned by that buffer.
+     */
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].type != LFS_TYPE_DIR) {
+            continue;
+        }
+        if (entries[i].duplicate &&
+                entries[i].status != LSCHK_STATUS_REAL) {
+            /* Avoid recursing into a ghost dir entry that does not actually
+             * resolve via the public API — it would just produce noise.
+             */
+            continue;
+        }
+
+        char child[SIM_PATH_MAX];
+        if (build_child_path(path, entries[i].name, child, sizeof(child)) == 0) {
+            err = sim_scan_dups_recursive(sim, child,
+                    dups_out, dirs_out, depth + 1, verbose);
+            if (err) {
+                free(entries);
+                return err;
+            }
+        }
+    }
+
+    free(entries);
+    return 0;
+}
+
+static int sim_scan_after_mount(sim_state_t *sim, bool verbose) {
+    if (!sim->mounted) {
+        fprintf(stderr, "lschk-on-mount: filesystem is not mounted\n");
+        return -1;
+    }
+    size_t dups = 0;
+    size_t dirs = 0;
+    int err = sim_scan_dups_recursive(sim, "/", &dups, &dirs, 0, verbose);
+    if (err) {
+        fprintf(stderr, "lschk-on-mount: scan failed: %d\n", err);
+        return err;
+    }
+    if (dups > 0) {
+        printf("[lschk-on-mount] WARNING: %zu duplicate-name entries found across %zu dirs\n",
+                dups, dirs);
+        printf("[lschk-on-mount] inspect with `lschk <path>`; clean up with `lsrepair2 <path>`\n");
+    } else {
+        printf("[lschk-on-mount] scan ok: %zu dirs checked, 0 duplicate names\n", dirs);
+    }
+    return 0;
+}
+
+static int cmd_lschk_on_mount(sim_state_t *sim, int argc, char **argv) {
+    if (argc < 2) {
+        printf("lschk-on-mount is currently %s\n",
+                g_lschk_on_mount ? "ON" : "OFF");
+        printf("usage: lschk-on-mount <on|off|now|status>\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        g_lschk_on_mount = 1;
+        printf("lschk-on-mount enabled — next mount will scan recursively for duplicate names\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        g_lschk_on_mount = 0;
+        printf("lschk-on-mount disabled\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        printf("lschk-on-mount is currently %s\n",
+                g_lschk_on_mount ? "ON" : "OFF");
+        return 0;
+    }
+    if (strcmp(argv[1], "now") == 0) {
+        if (ensure_mounted(sim)) {
+            return -1;
+        }
+        return sim_scan_after_mount(sim, true);
+    }
+    fprintf(stderr, "usage: lschk-on-mount <on|off|now|status>\n");
+    return -1;
 }
 
 static int cmd_lschk(sim_state_t *sim, int argc, char **argv) {
@@ -5320,6 +5485,28 @@ static int dispatch_command(sim_state_t *sim, int argc, char **argv, bool *shoul
     }
     if (strcmp(argv[0], "inspect") == 0) {
         return cmd_inspect(sim, argc, argv);
+    }
+    if (strcmp(argv[0], "dual-handle") == 0) {
+        /* Debug: invoke chaosstress's stale-handle injector directly.
+         * Equivalent to one iteration of the (step % 3 == 1) branch inside
+         * chaosstress, without the surrounding random noise. */
+        (void)argc; (void)argv;
+        if (ensure_mounted(sim)) {
+            return -1;
+        }
+        return inject_dual_idx_handle_crossclose(sim);
+    }
+    if (strcmp(argv[0], "stale-rename") == 0) {
+        /* Debug: invoke the rename + recreated-handle injector once.
+         * Equivalent to one iteration of the (step % 3 == 0) branch. */
+        (void)argc; (void)argv;
+        if (ensure_mounted(sim)) {
+            return -1;
+        }
+        return inject_idx_rename_recreate_handle(sim);
+    }
+    if (strcmp(argv[0], "lschk-on-mount") == 0) {
+        return cmd_lschk_on_mount(sim, argc, argv);
     }
     if (strcmp(argv[0], "quit") == 0 || strcmp(argv[0], "exit") == 0) {
         *should_exit = true;
