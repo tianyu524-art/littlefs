@@ -1,0 +1,230 @@
+
+<h2 class="sr-only">软硬件协同使能系数校准工具：切换负载场景查看各优化维度的实际可信区间、Amdahl约束和校准建议</h2>
+<style>
+.wt{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.wb{padding:5px 13px;border-radius:20px;font-size:12px;border:0.5px solid var(--color-border-secondary);cursor:pointer;color:var(--color-text-secondary);transition:all .15s}
+.wb.on{font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th{font-weight:500;font-size:11px;color:var(--color-text-secondary);padding:5px 7px;border-bottom:0.5px solid var(--color-border-secondary);text-align:left;white-space:nowrap;background:var(--color-background-secondary)}
+td{padding:5px 7px;border-bottom:0.5px solid var(--color-border-tertiary);vertical-align:middle}
+.bw{display:flex;align-items:center;gap:5px}
+.bb{flex:1;height:7px;background:var(--color-background-secondary);border-radius:4px;overflow:hidden;min-width:60px}
+.bf{height:100%;border-radius:4px;transition:width .4s}
+.vd{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:500}
+.v-ok{background:#1D9E7522;color:#085041;border:0.5px solid #1D9E75}
+.v-warn{background:#BA751722;color:#633806;border:0.5px solid #BA7517}
+.v-bad{background:#E24B4A22;color:#791F1F;border:0.5px solid #E24B4A}
+.v-na{background:var(--color-background-secondary);color:var(--color-text-tertiary);border:0.5px solid var(--color-border-tertiary)}
+.sc{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}
+.sk{flex:1;min-width:100px;background:var(--color-background-secondary);border-radius:8px;padding:8px 10px}
+.sk .l{font-size:10px;color:var(--color-text-tertiary);margin-bottom:2px}
+.sk .v{font-size:17px;font-weight:500;color:var(--color-text-primary)}
+.sk .d{font-size:10px;color:var(--color-text-tertiary);margin-top:1px}
+.nb{background:var(--color-background-secondary);border-left:3px solid #185FA5;border-radius:0 6px 6px 0;padding:7px 11px;margin-bottom:10px;font-size:12px;line-height:1.6;color:var(--color-text-secondary)}
+</style>
+
+<div class="wt" id="wt"></div>
+<div class="nb" id="wd"></div>
+<div class="sc" id="sc"></div>
+
+<div style="overflow-x:auto">
+<table>
+<thead><tr>
+  <th style="min-width:110px">优化维度</th>
+  <th>原表<br>基线</th><th>原表<br>上限</th><th>原表<br>倍数</th>
+  <th style="min-width:90px">校准基线</th>
+  <th style="min-width:90px">校准上限</th>
+  <th>可信度</th>
+  <th>偏差根因</th>
+</tr></thead>
+<tbody id="tb"></tbody>
+</table>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px">
+  <div>
+    <div style="font-size:12px;font-weight:500;margin-bottom:6px;color:var(--color-text-primary)">Amdahl定律约束：最大可能加速比</div>
+    <div style="position:relative;height:180px"><canvas id="amc" role="img" aria-label="Amdahl约束曲线，显示不同缓存受限比例下的最大系统加速比">Amdahl约束图表</canvas></div>
+    <div style="font-size:10px;color:var(--color-text-tertiary);margin-top:4px" id="amn"></div>
+  </div>
+  <div>
+    <div style="font-size:12px;font-weight:500;margin-bottom:6px;color:var(--color-text-primary)">优化维度交互矩阵（协同/拮抗关系）</div>
+    <canvas id="imc" role="img" aria-label="五个优化维度之间的协同与拮抗关系热图">交互矩阵图表</canvas>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const WL=[
+  {n:"游戏(7800X3D)",c:"#185FA5",P:0.35,
+   d:"单CCD，V-Cache对游戏线程完全透明，无跨CCD调度问题。缓存受限比例P≈35%，Amdahl最大加速约1.4×",
+   rows:[
+    {n:"3D拓扑感知调度",o:[0.30,0.85,"2.8×"],cal:[0.82,0.90,"1.1×"],v:"warn",r:"单CCD产品此行不适用。基线应≥0.80，原表0.30仅适用于双CCD错误调度场景"},
+    {n:"统一内存管理",o:[0.20,0.90,"4.5×"],cal:[null,null,"—"],v:"na",r:"游戏无GPU-CPU统一内存需求，此行对消费级CPU游戏完全不适用"},
+    {n:"热感知调度",o:[0.50,0.88,"1.8×"],cal:[0.82,0.90,"1.1×"],v:"warn",r:"9800X3D V-Cache移至底部后散热改善，桌面游戏热节流少见，基线应0.82+"},
+    {n:"运行时零拷贝",o:[0.25,0.85,"3.4×"],cal:[null,null,"—"],v:"na",r:"CPU游戏负载无大量GPU-CPU内存搬运，此维度不适用"},
+    {n:"编译器3D优化",o:[0.60,0.92,"1.5×"],cal:[0.85,0.92,"1.08×"],v:"warn",r:"游戏二进制多为PGO预编译，且GCC/LLVM不建模L3大小，实测编译器增益5-12%非53%"},
+    {n:"综合效果",o:[0.15,0.82,"5.5×"],cal:[0.70,0.86,"1.23×"],v:"bad",r:"实测7800X3D游戏+15~35%，对应~1.2-1.35×，5.5×违反Amdahl(P=35%时理论上限1.4×)"},
+   ]},
+  {n:"AI推理(MI300X)",c:"#854F0B",P:0.82,
+   d:"统一HBM3 192GB，带宽3.5TB/s。LLM推理高度带宽受限，P≈82%，Amdahl最大加速约5.6×",
+   rows:[
+    {n:"3D拓扑感知调度",o:[0.30,0.85,"2.8×"],cal:[0.55,0.78,"1.42×"],v:"warn",r:"多GCD调度和NPS模式选择影响显著，但基线0.55比原表0.30更合理"},
+    {n:"统一内存管理",o:[0.20,0.90,"4.5×"],cal:[0.18,0.87,"4.8×"],v:"ok",r:"最可信行。PCIe 64GB/s vs HBM3 3.5TB/s差54×，LLM推理实测3-5×增益有文献支撑"},
+    {n:"热感知调度",o:[0.50,0.88,"1.8×"],cal:[0.60,0.86,"1.43×"],v:"ok",r:"HBM3高功耗持续运行热管理重要，1.4×对服务器场景合理，基线0.60比0.50更准确"},
+    {n:"运行时零拷贝",o:[0.25,0.85,"3.4×"],cal:[0.20,0.88,"4.4×"],v:"ok",r:"最可信行之一。消除LLM推理中CPU→GPU权重拷贝，实测3-5×增益可复现"},
+    {n:"编译器3D优化",o:[0.60,0.92,"1.5×"],cal:[0.55,0.82,"1.49×"],v:"ok",r:"Triton/MLIR对HBM tile大小感知明确，1.5×在AI编译场景接近真实"},
+    {n:"综合效果",o:[0.15,0.82,"5.5×"],cal:[0.12,0.82,"6.8×"],v:"ok",r:"AI推理最接近原表假设。无优化SW仅用~15%峰值带宽，全栈后~80%，倍数甚至略低估"},
+   ]},
+  {n:"HPC/CFD(EPYC-X)",c:"#0F6E56",P:0.62,
+   d:"EPYC Genoa-X每CCD 96MB L3。CFD稀疏矩阵操作内存带宽受限，P≈62%，Amdahl最大加速约2.6×",
+   rows:[
+    {n:"3D拓扑感知调度",o:[0.30,0.85,"2.8×"],cal:[0.55,0.80,"1.45×"],v:"warn",r:"8CCD NPS模式和MPI绑核对性能影响显著，基线0.55比0.30更真实"},
+    {n:"统一内存管理",o:[0.20,0.90,"4.5×"],cal:[0.55,0.82,"1.49×"],v:"warn",r:"HPC用DDR5非统一内存，此优化对CPU-only HPC收益有限，原表高估"},
+    {n:"热感知调度",o:[0.50,0.88,"1.8×"],cal:[0.65,0.88,"1.35×"],v:"ok",r:"服务器持续高负载热节流真实，1.35×符合实测预期"},
+    {n:"运行时零拷贝",o:[0.25,0.85,"3.4×"],cal:[0.65,0.80,"1.23×"],v:"warn",r:"HPC数据主要在CPU端，GPU拷贝开销小，此维度收益有限"},
+    {n:"编译器3D优化",o:[0.60,0.92,"1.5×"],cal:[0.65,0.90,"1.38×"],v:"ok",r:"HPC代码可重编译，显式tiling针对大L3效果明显，实测+10-30%"},
+    {n:"综合效果",o:[0.15,0.82,"5.5×"],cal:[0.38,0.80,"2.1×"],v:"warn",r:"Phoronix实测Genoa-X vs Genoa +47-52%，综合~2×。5.5×超出Amdahl上限2.6×"},
+   ]},
+  {n:"数据库OLTP",c:"#534AB7",P:0.55,
+   d:"MySQL/PostgreSQL热点数据集50-150MB，V-Cache 96MB能承载大部分热页面，P≈55%，Amdahl最大加速约2.2×",
+   rows:[
+    {n:"3D拓扑感知调度",o:[0.30,0.85,"2.8×"],cal:[0.60,0.82,"1.37×"],v:"warn",r:"OLTP多线程绑核对命中率关键，但随机调度基线0.60比0.30更合理"},
+    {n:"统一内存管理",o:[0.20,0.90,"4.5×"],cal:[0.55,0.82,"1.49×"],v:"warn",r:"Buffer Pool已是成熟管理技术，'未优化'基线比原表高得多"},
+    {n:"热感知调度",o:[0.50,0.88,"1.8×"],cal:[0.70,0.88,"1.26×"],v:"ok",r:"24/7持续负载热管理重要，1.26×对服务器数据库合理"},
+    {n:"运行时零拷贝",o:[0.25,0.85,"3.4×"],cal:[0.65,0.82,"1.26×"],v:"warn",r:"数据库内核路径已高度优化拷贝，此维度提升有限"},
+    {n:"编译器3D优化",o:[0.60,0.92,"1.5×"],cal:[0.70,0.88,"1.26×"],v:"ok",r:"PostgreSQL支持PGO，实测DB场景编译优化+10-20%，1.26×符合"},
+    {n:"综合效果",o:[0.15,0.82,"5.5×"],cal:[0.42,0.78,"1.86×"],v:"warn",r:"AMD EPYC Milan-X DB场景实测+22-50%，综合约1.8-2×，5.5×高估"},
+   ]},
+  {n:"双CCD调度(9950X3D)",c:"#993C1D",P:0.40,
+   d:"双CCD非对称拓扑：CCD0有96MB V-Cache，CCD1仅32MB。跨CCD延迟75-80ns≈DRAM延迟，调度是核心瓶颈",
+   rows:[
+    {n:"3D拓扑感知调度",o:[0.30,0.85,"2.8×"],cal:[0.50,0.84,"1.68×"],v:"ok",r:"最适用场景，原理最清晰。基线0.50更准：随机调度时50%时间在CCD1，非0.30"},
+    {n:"统一内存管理",o:[0.20,0.90,"4.5×"],cal:[null,null,"—"],v:"na",r:"消费级DDR5，无统一内存架构，不适用"},
+    {n:"热感知调度",o:[0.50,0.88,"1.8×"],cal:[0.72,0.88,"1.22×"],v:"warn",r:"9950X3D散热改善，桌面级节流不严重，1.22×更真实"},
+    {n:"运行时零拷贝",o:[0.25,0.85,"3.4×"],cal:[null,null,"—"],v:"na",r:"CPU游戏负载无GPU大量数据搬运，不适用"},
+    {n:"编译器3D优化",o:[0.60,0.92,"1.5×"],cal:[0.82,0.90,"1.10×"],v:"warn",r:"游戏二进制已优化，L3感知改善边际收益有限，5-12%更真实"},
+    {n:"综合效果",o:[0.15,0.82,"5.5×"],cal:[0.56,0.83,"1.48×"],v:"warn",r:"实测9950X3D游戏+20-30%，正确调度后1.3-1.5×，Amdahl上限(P=40%)为1.67×"},
+   ]},
+];
+
+let cur=0, amc=null, imc=null;
+const DIMS=["拓扑调度","统一内存","热感知","零拷贝","编译器"];
+
+function setWL(i){
+  cur=i;
+  document.querySelectorAll('.wb').forEach((b,j)=>b.classList.toggle('on',i===j));
+  render();
+}
+
+function render(){
+  const wl=WL[cur];
+  document.getElementById('wd').innerHTML=wl.d;
+  document.getElementById('wd').style.borderColor=wl.c;
+
+  const rows=wl.rows.filter(r=>r.cal[0]!==null);
+  const maxSpeedup=(1/(1-wl.P)).toFixed(2);
+  const amdahl=(s)=>1/((1-wl.P)+wl.P/s);
+  const calComposite=wl.rows.find(r=>r.n.includes('综合'));
+  const calMult=calComposite.cal[2];
+
+  document.getElementById('sc').innerHTML=`
+    <div class="sk"><div class="l">缓存受限比例 P</div><div class="v">${(wl.P*100).toFixed(0)}%</div><div class="d">Amdahl分母来源</div></div>
+    <div class="sk"><div class="l">Amdahl理论上限</div><div class="v">${maxSpeedup}×</div><div class="d">假设LLC Miss清零</div></div>
+    <div class="sk"><div class="l">原表综合倍数</div><div class="v" style="color:#E24B4A">5.5×</div><div class="d">vs Amdahl上限${maxSpeedup}×</div></div>
+    <div class="sk"><div class="l">校准综合倍数</div><div class="v" style="color:#1D9E75">${calMult}</div><div class="d">基于实测数据</div></div>`;
+
+  const tb=document.getElementById('tb');
+  tb.innerHTML='';
+  wl.rows.forEach(row=>{
+    const na=row.cal[0]===null;
+    const vmap={ok:'v-ok',warn:'v-warn',bad:'v-bad',na:'v-na'};
+    const vlab={ok:'合理',warn:'偏差',bad:'严重偏差',na:'不适用'};
+    const isSum=row.n.includes('综合');
+    tb.innerHTML+=`<tr${isSum?' style="background:var(--color-background-secondary);font-weight:500"':''}>
+      <td>${row.n}</td>
+      <td>${row.o[0]}</td><td>${row.o[1]}</td><td>${row.o[2]}</td>
+      <td>${na?'—':`<div class="bw"><div class="bb"><div class="bf" style="width:${(row.cal[0]*100).toFixed(0)}%;background:${wl.c}66"></div></div>${row.cal[0].toFixed(2)}</div>`}</td>
+      <td>${na?'—':`<div class="bw"><div class="bb"><div class="bf" style="width:${(row.cal[1]*100).toFixed(0)}%;background:${wl.c}"></div></div>${row.cal[1].toFixed(2)}</div>`}</td>
+      <td><span class="vd ${vmap[row.v]}">${vlab[row.v]}</span></td>
+      <td style="font-size:10.5px;color:var(--color-text-tertiary);max-width:220px">${row.r}</td>
+    </tr>`;
+  });
+
+  updateAmd(wl);
+  updateMatrix();
+}
+
+function updateAmd(wl){
+  const P=wl.P;
+  const pts=[1,1.5,2,3,4,6,8,12,20,50];
+  const vals=pts.map(s=>1/((1-P)+P/s));
+  if(amc) amc.destroy();
+  amc=new Chart(document.getElementById('amc'),{
+    type:'line',
+    data:{
+      labels:pts.map(s=>s+'×'),
+      datasets:[
+        {label:'系统最大加速',data:vals,borderColor:WL[cur].c,backgroundColor:WL[cur].c+'22',fill:true,tension:0.4,pointRadius:3,borderWidth:2},
+        {label:'原表5.5×',data:Array(pts.length).fill(5.5),borderColor:'#E24B4A',borderDash:[5,4],borderWidth:1.5,pointRadius:0,fill:false},
+      ]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.raw.toFixed(2)+'×'}}},
+      scales:{
+        x:{title:{display:true,text:'LLC命中率改善倍数',font:{size:10}},ticks:{font:{size:9}}},
+        y:{title:{display:true,text:'端到端加速',font:{size:10}},ticks:{font:{size:9},callback:v=>v.toFixed(1)+'×'},min:1}
+      }
+    }
+  });
+  document.getElementById('amn').textContent=`P=${(P*100).toFixed(0)}%时，即使LLC Miss完全消除，理论上限=${(1/(1-P)).toFixed(2)}×；原表5.5×在本场景${5.5>(1/(1-P))?'违反':'符合'}Amdahl约束`;
+}
+
+function updateMatrix(){
+  const mat=[
+    [1, 0.6, 0.3, 0.2, 0.5],
+    [0.6,1, 0.5, 0.9, 0.4],
+    [0.3,0.5,1, 0.2, 0.1],
+    [0.2,0.9,0.2,1, 0.3],
+    [0.5,0.4,0.1,0.3,1]
+  ];
+  const colors=mat.flat().map(v=>{
+    if(v>=0.8) return '#1D9E7588';
+    if(v>=0.5) return '#BA751755';
+    if(v>=0.2) return '#7F77DD33';
+    return '#88878022';
+  });
+  if(imc) imc.destroy();
+  imc=new Chart(document.getElementById('imc'),{
+    type:'scatter',
+    data:{datasets:[{
+      data:DIMS.flatMap((_,i)=>DIMS.map((_,j)=>({x:j,y:4-i,r:Math.max(4,mat[i][j]*18)}))),
+      backgroundColor:colors,
+      borderWidth:0,
+    }]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:(c)=>{const i=4-c.parsed.y,j=c.parsed.x; return `${DIMS[i]}↔${DIMS[j]}: ${mat[i][j]>=0.8?'强协同':mat[i][j]>=0.5?'中等协同':mat[i][j]>=0.2?'弱协同':'独立'}`}
+      }}},
+      scales:{
+        x:{min:-0.5,max:4.5,ticks:{callback:v=>DIMS[v]||'',font:{size:9}},grid:{display:false}},
+        y:{min:-0.5,max:4.5,ticks:{callback:v=>DIMS[4-v]||'',font:{size:9}},grid:{display:false}}
+      }
+    }
+  });
+}
+
+const tabs=document.getElementById('wt');
+WL.forEach((w,i)=>{
+  const b=document.createElement('div');
+  b.className='wb'+(i===0?' on':'');
+  b.textContent=w.n;
+  b.onclick=()=>setWL(i);
+  b.style.cssText=i===0?`border-color:${w.c};color:${w.c};background:${w.c}11`:''
+  tabs.appendChild(b);
+});
+
+setWL(0);
+</script>
