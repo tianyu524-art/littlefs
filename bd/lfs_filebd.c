@@ -10,27 +10,64 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <time.h>
 
 #ifdef _WIN32
+#include <io.h>
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
-int lfs_filebd_create(const struct lfs_config *cfg, const char *path,
+volatile int g_flash_fault_injection_enabled = 0;
+volatile int g_flash_fault_injection_start = 0;
+
+#ifdef _WIN32
+static DWORD WINAPI lfs_filebd_fault_worker(LPVOID arg) {
+    (void)arg;
+    while (1) {
+        DWORD delay_ms = 100u + (DWORD)(rand() % 401);
+        Sleep(delay_ms);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 1;
+        }
+    }
+    return 0;
+}
+#else
+static void *lfs_filebd_fault_worker(void *arg) {
+    (void)arg;
+    while (1) {
+        unsigned delay_ms = 100u + (unsigned)(rand() % 401);
+        usleep(delay_ms * 1000u);
+        if (g_flash_fault_injection_start == 1) {
+            g_flash_fault_injection_enabled = 0;
+        }
+    }
+    return NULL;
+}
+#endif
+
+int lfs_filebd_createcfg(const struct lfs_config *cfg, const char *path,
         const struct lfs_filebd_config *bdcfg) {
-    LFS_FILEBD_TRACE("lfs_filebd_create(%p {.context=%p, "
-                ".read=%p, .prog=%p, .erase=%p, .sync=%p}, "
+    LFS_FILEBD_TRACE("lfs_filebd_createcfg(%p {.context=%p, "
+                ".read=%p, .prog=%p, .erase=%p, .sync=%p, "
+                ".read_size=%"PRIu32", .prog_size=%"PRIu32", "
+                ".block_size=%"PRIu32", .block_count=%"PRIu32"}, "
                 "\"%s\", "
-                "%p {.read_size=%"PRIu32", .prog_size=%"PRIu32", "
-                ".erase_size=%"PRIu32", .erase_count=%"PRIu32"})",
+                "%p {.erase_value=%"PRId32"})",
             (void*)cfg, cfg->context,
             (void*)(uintptr_t)cfg->read, (void*)(uintptr_t)cfg->prog,
             (void*)(uintptr_t)cfg->erase, (void*)(uintptr_t)cfg->sync,
-            path,
-            (void*)bdcfg,
-            bdcfg->read_size, bdcfg->prog_size, bdcfg->erase_size,
-            bdcfg->erase_count);
+            cfg->read_size, cfg->prog_size, cfg->block_size, cfg->block_count,
+            path, (void*)bdcfg, bdcfg->erase_value);
     lfs_filebd_t *bd = cfg->context;
     bd->cfg = bdcfg;
+    g_flash_fault_injection_enabled = 0;
+    g_flash_fault_injection_start = 0;
+    srand((unsigned)time(NULL));
 
     // open file
     #ifdef _WIN32
@@ -41,12 +78,42 @@ int lfs_filebd_create(const struct lfs_config *cfg, const char *path,
 
     if (bd->fd < 0) {
         int err = -errno;
-        LFS_FILEBD_TRACE("lfs_filebd_create -> %d", err);
+        LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", err);
         return err;
     }
 
-    LFS_FILEBD_TRACE("lfs_filebd_create -> %d", 0);
+#ifdef _WIN32
+        HANDLE worker = CreateThread(NULL, 0, lfs_filebd_fault_worker, NULL, 0, NULL);
+        if (worker) {
+            CloseHandle(worker);
+        }
+
+#else
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, lfs_filebd_fault_worker, NULL) == 0) {
+            pthread_detach(worker);
+        }
+#endif
+
+    LFS_FILEBD_TRACE("lfs_filebd_createcfg -> %d", 0);
     return 0;
+}
+
+int lfs_filebd_create(const struct lfs_config *cfg, const char *path) {
+    LFS_FILEBD_TRACE("lfs_filebd_create(%p {.context=%p, "
+                ".read=%p, .prog=%p, .erase=%p, .sync=%p, "
+                ".read_size=%"PRIu32", .prog_size=%"PRIu32", "
+                ".block_size=%"PRIu32", .block_count=%"PRIu32"}, "
+                "\"%s\")",
+            (void*)cfg, cfg->context,
+            (void*)(uintptr_t)cfg->read, (void*)(uintptr_t)cfg->prog,
+            (void*)(uintptr_t)cfg->erase, (void*)(uintptr_t)cfg->sync,
+            cfg->read_size, cfg->prog_size, cfg->block_size, cfg->block_count,
+            path);
+    static const struct lfs_filebd_config defaults = {.erase_value=-1};
+    int err = lfs_filebd_createcfg(cfg, path, &defaults);
+    LFS_FILEBD_TRACE("lfs_filebd_create -> %d", err);
+    return err;
 }
 
 int lfs_filebd_destroy(const struct lfs_config *cfg) {
@@ -70,17 +137,18 @@ int lfs_filebd_read(const struct lfs_config *cfg, lfs_block_t block,
     lfs_filebd_t *bd = cfg->context;
 
     // check if read is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
-    LFS_ASSERT(off  % bd->cfg->read_size == 0);
-    LFS_ASSERT(size % bd->cfg->read_size == 0);
-    LFS_ASSERT(off+size <= bd->cfg->erase_size);
+    LFS_ASSERT(off  % cfg->read_size == 0);
+    LFS_ASSERT(size % cfg->read_size == 0);
+    LFS_ASSERT(block < cfg->block_count);
 
     // zero for reproducibility (in case file is truncated)
-    memset(buffer, 0, size);
+    if (bd->cfg->erase_value != -1) {
+        memset(buffer, bd->cfg->erase_value, size);
+    }
 
     // read
     off_t res1 = lseek(bd->fd,
-            (off_t)block*bd->cfg->erase_size + (off_t)off, SEEK_SET);
+            (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
     if (res1 < 0) {
         int err = -errno;
         LFS_FILEBD_TRACE("lfs_filebd_read -> %d", err);
@@ -100,47 +168,106 @@ int lfs_filebd_read(const struct lfs_config *cfg, lfs_block_t block,
 
 int lfs_filebd_prog(const struct lfs_config *cfg, lfs_block_t block,
         lfs_off_t off, const void *buffer, lfs_size_t size) {
-    LFS_FILEBD_TRACE("lfs_filebd_prog(%p, "
-                "0x%"PRIx32", %"PRIu32", %p, %"PRIu32")",
+    LFS_FILEBD_TRACE("lfs_filebd_prog(%p, 0x%"PRIx32", %"PRIu32", %p, %"PRIu32")",
             (void*)cfg, block, off, buffer, size);
     lfs_filebd_t *bd = cfg->context;
 
     // check if write is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
-    LFS_ASSERT(off  % bd->cfg->prog_size == 0);
-    LFS_ASSERT(size % bd->cfg->prog_size == 0);
-    LFS_ASSERT(off+size <= bd->cfg->erase_size);
+    LFS_ASSERT(off  % cfg->prog_size == 0);
+    LFS_ASSERT(size % cfg->prog_size == 0);
+    LFS_ASSERT(block < cfg->block_count);
+
+    // check that data was erased? only needed for testing
+    if (bd->cfg->erase_value != -1) {
+        off_t res1 = lseek(bd->fd,
+                (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
+        if (res1 < 0) {
+            int err = -errno;
+            LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+            return err;
+        }
+
+        for (lfs_off_t i = 0; i < size; i++) {
+            uint8_t c;
+            ssize_t res2 = read(bd->fd, &c, 1);
+            if (res2 < 0) {
+                int err = -errno;
+                LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+                return err;
+            }
+
+            LFS_ASSERT(c == bd->cfg->erase_value);
+        }
+    }
+
+    // inject a single-byte fault into small writes once the fault switch is on
+    uint8_t *fault_buffer = NULL;
+    const void *write_buffer = buffer;
+    if (g_flash_fault_injection_enabled && size > 0 && size < 256) {
+        fault_buffer = malloc(size);
+        if (!fault_buffer) {
+            int err = -ENOMEM;
+            LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
+            return err;
+        }
+
+        memcpy(fault_buffer, buffer, size);
+        lfs_size_t fault_offset = (lfs_size_t)(rand() % size);
+        fault_buffer[fault_offset] = rand() % 0xff;
+        write_buffer = fault_buffer;
+        g_flash_fault_injection_enabled = 0;
+        printf("\n***#####filebd flash error#####***\n");
+    }
 
     // program data
     off_t res1 = lseek(bd->fd,
-            (off_t)block*bd->cfg->erase_size + (off_t)off, SEEK_SET);
+            (off_t)block*cfg->block_size + (off_t)off, SEEK_SET);
     if (res1 < 0) {
         int err = -errno;
+        free(fault_buffer);
         LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
         return err;
     }
 
-    ssize_t res2 = write(bd->fd, buffer, size);
+    ssize_t res2 = write(bd->fd, write_buffer, size);
     if (res2 < 0) {
         int err = -errno;
+        free(fault_buffer);
         LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", err);
         return err;
     }
+
+    free(fault_buffer);
 
     LFS_FILEBD_TRACE("lfs_filebd_prog -> %d", 0);
     return 0;
 }
 
 int lfs_filebd_erase(const struct lfs_config *cfg, lfs_block_t block) {
-    LFS_FILEBD_TRACE("lfs_filebd_erase(%p, 0x%"PRIx32" (%"PRIu32"))",
-            (void*)cfg, block, ((lfs_filebd_t*)cfg->context)->cfg->erase_size);
+    LFS_FILEBD_TRACE("lfs_filebd_erase(%p, 0x%"PRIx32")", (void*)cfg, block);
     lfs_filebd_t *bd = cfg->context;
 
     // check if erase is valid
-    LFS_ASSERT(block < bd->cfg->erase_count);
+    LFS_ASSERT(block < cfg->block_count);
 
-    // erase is a noop
-    (void)block;
+    // erase, only needed for testing
+    if (bd->cfg->erase_value != -1) {
+        off_t res1 = lseek(bd->fd, (off_t)block*cfg->block_size, SEEK_SET);
+        if (res1 < 0) {
+            int err = -errno;
+            LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
+            return err;
+        }
+
+        for (lfs_off_t i = 0; i < cfg->block_size; i++) {
+            ssize_t res2 = write(bd->fd, &(uint8_t){bd->cfg->erase_value}, 1);
+            if (res2 < 0) {
+                int err = -errno;
+                LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", err);
+                return err;
+            }
+        }
+    }
 
     LFS_FILEBD_TRACE("lfs_filebd_erase -> %d", 0);
     return 0;
@@ -148,11 +275,10 @@ int lfs_filebd_erase(const struct lfs_config *cfg, lfs_block_t block) {
 
 int lfs_filebd_sync(const struct lfs_config *cfg) {
     LFS_FILEBD_TRACE("lfs_filebd_sync(%p)", (void*)cfg);
-
     // file sync
     lfs_filebd_t *bd = cfg->context;
     #ifdef _WIN32
-    int err = FlushFileBuffers((HANDLE) _get_osfhandle(bd->fd)) ? 0 : -1;
+    int err = FlushFileBuffers((HANDLE)_get_osfhandle(bd->fd)) ? 0 : -1;
     #else
     int err = fsync(bd->fd);
     #endif

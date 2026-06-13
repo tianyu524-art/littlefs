@@ -1,0 +1,169 @@
+
+<h2 class="sr-only">交互式RC延迟计算器：调节导线长度观察τ=RC的平方律效应</h2>
+<style>
+.rc-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:1rem 0; }
+.rc-card { background:var(--color-background-secondary); border-radius:var(--border-radius-md); padding:12px 14px; }
+.rc-label { font-size:12px; color:var(--color-text-secondary); margin:0 0 4px; }
+.rc-val { font-size:20px; font-weight:500; color:var(--color-text-primary); margin:0; }
+.rc-unit { font-size:11px; color:var(--color-text-tertiary); }
+.wire-row { display:flex; align-items:center; gap:12px; margin:1.2rem 0 0.4rem; }
+.wire-bar-bg { flex:1; height:14px; background:var(--color-background-secondary); border-radius:7px; overflow:hidden; border:0.5px solid var(--color-border-tertiary); }
+.wire-bar { height:100%; border-radius:7px; transition:width 0.2s; background:#7F77DD; }
+.formula-row { display:flex; gap:10px; flex-wrap:wrap; margin:1rem 0; }
+.formula-chip { font-size:12px; padding:4px 10px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); color:var(--color-text-secondary); font-family:var(--font-mono); }
+.highlight-chip { border-color:#7F77DD; color:#3C3489; background:#EEEDFE; }
+.tech-row { display:flex; gap:8px; margin:0.8rem 0; flex-wrap:wrap; }
+.tech-btn { font-size:12px; padding:4px 12px; border-radius:20px; border:0.5px solid var(--color-border-secondary); background:transparent; color:var(--color-text-secondary); cursor:pointer; transition:all .15s; }
+.tech-btn.active { background:#EEEDFE; border-color:#7F77DD; color:#3C3489; }
+</style>
+
+<div style="font-size:13px; color:var(--color-text-secondary); margin:0.5rem 0 0.8rem;">选择工艺节点，拖动导线长度，实时观察 R、C、τ 如何随 L² 变化</div>
+
+<div class="tech-row">
+  <button class="tech-btn active" onclick="setTech('n28')" id="btn-n28">N28 传统</button>
+  <button class="tech-btn" onclick="setTech('n7')" id="btn-n7">N7 先进</button>
+  <button class="tech-btn" onclick="setTech('n3')" id="btn-n3">N3 前沿</button>
+  <button class="tech-btn" onclick="setTech('tsv')" id="btn-tsv">TSV 垂直</button>
+</div>
+
+<div style="display:flex;align-items:center;gap:12px;margin:1rem 0 0.3rem;">
+  <span style="font-size:13px;color:var(--color-text-secondary);min-width:60px;">导线长度</span>
+  <input type="range" id="len-slider" min="1" max="200" value="100" step="1" style="flex:1;" oninput="update()">
+  <span id="len-out" style="font-size:14px;font-weight:500;min-width:52px;text-align:right;">100 μm</span>
+</div>
+
+<div class="wire-row">
+  <span style="font-size:12px;color:var(--color-text-tertiary);min-width:60px;">导线示意</span>
+  <div class="wire-bar-bg"><div class="wire-bar" id="wire-bar" style="width:50%"></div></div>
+</div>
+
+<div class="rc-grid">
+  <div class="rc-card">
+    <p class="rc-label">电阻 R</p>
+    <p class="rc-val" id="r-val">85 <span class="rc-unit">Ω</span></p>
+    <p style="font-size:11px;color:var(--color-text-tertiary);margin:4px 0 0;">R ∝ L</p>
+  </div>
+  <div class="rc-card">
+    <p class="rc-label">电容 C</p>
+    <p class="rc-val" id="c-val">20 <span class="rc-unit">fF</span></p>
+    <p style="font-size:11px;color:var(--color-text-tertiary);margin:4px 0 0;">C ∝ L</p>
+  </div>
+  <div class="rc-card" style="border:1px solid #AFA9EC;">
+    <p class="rc-label">延迟 τ = RC</p>
+    <p class="rc-val" id="tau-val" style="color:#3C3489;">1.70 <span class="rc-unit">ps</span></p>
+    <p style="font-size:11px;color:#534AB7;margin:4px 0 0;">τ ∝ L²</p>
+  </div>
+</div>
+
+<div class="formula-row">
+  <span class="formula-chip">R = ρ·L/A</span>
+  <span class="formula-chip">C = ε·W·L/d</span>
+  <span class="formula-chip highlight-chip">τ = RC ∝ L²</span>
+</div>
+
+<div style="font-size:12px;color:var(--color-text-secondary);margin:0.5rem 0 1rem;padding:10px 12px;background:var(--color-background-secondary);border-radius:var(--border-radius-md);border-left:3px solid #7F77DD;">
+  <span id="insight-text">当导线从 100μm → 10μm，延迟从 1.70ps → 0.017ps，降低 100×</span>
+</div>
+
+<div style="height:200px;position:relative;">
+  <canvas id="tau-chart" role="img" aria-label="τ随导线长度L的平方律变化曲线">延迟τ随导线长度L增加呈平方律上升。</canvas>
+</div>
+<div style="display:flex;gap:16px;margin-top:8px;font-size:12px;color:var(--color-text-secondary);">
+  <span style="display:flex;align-items:center;gap:4px;"><span style="width:10px;height:2px;background:#7F77DD;display:inline-block;"></span>τ = RC (当前工艺)</span>
+  <span style="display:flex;align-items:center;gap:4px;"><span style="width:10px;height:2px;background:#D85A30;display:inline-block;border-top:2px dashed #D85A30;height:0;"></span>线性参考 τ ∝ L</span>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const TECH = {
+  n28: { rho:2.2e-8, eps:3.0*8.85e-12, W:100e-9, T:200e-9, d:150e-9, label:'N28' },
+  n7:  { rho:2.8e-8, eps:2.6*8.85e-12, W:36e-9,  T:120e-9, d:90e-9,  label:'N7' },
+  n3:  { rho:3.5e-8, eps:2.4*8.85e-12, W:18e-9,  T:70e-9,  d:60e-9,  label:'N3' },
+  tsv: { rho:1.7e-8, eps:3.9*8.85e-12, W:5e-6,   T:50e-6,  d:5e-6,   label:'TSV', maxL:200, unitL:'μm', scaleL:1e-6 }
+};
+let curTech = 'n28';
+
+function calcRC(L_um, tech) {
+  const t = TECH[tech];
+  const L = L_um * 1e-6;
+  const A = t.W * t.T;
+  const R = t.rho * L / A;
+  const C = t.eps * t.W * L / t.d;
+  const tau = R * C;
+  return { R, C, tau };
+}
+
+function fmtR(v) {
+  if(v >= 1e3) return (v/1e3).toFixed(1)+'k Ω';
+  if(v >= 1) return Math.round(v)+' Ω';
+  return (v*1000).toFixed(1)+' mΩ';
+}
+function fmtC(v) {
+  if(v >= 1e-12) return (v*1e12).toFixed(1)+' pF';
+  return (v*1e15).toFixed(2)+' fF';
+}
+function fmtT(v) {
+  if(v >= 1e-9) return (v*1e9).toFixed(2)+' ns';
+  if(v >= 1e-12) return (v*1e12).toFixed(2)+' ps';
+  return (v*1e15).toFixed(1)+' fs';
+}
+
+const labels = Array.from({length:200},(_,i)=>i+1);
+const ctx = document.getElementById('tau-chart').getContext('2d');
+const chart = new Chart(ctx, {
+  type:'line',
+  data:{
+    labels,
+    datasets:[
+      { label:'τ = RC', data:[], borderColor:'#7F77DD', borderWidth:2, pointRadius:0, tension:0.3, fill:false },
+      { label:'线性参考', data:[], borderColor:'#D85A30', borderWidth:1.5, borderDash:[5,4], pointRadius:0, tension:0, fill:false }
+    ]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false}, tooltip:{
+      callbacks:{ label: ctx => fmtT(ctx.raw) }
+    }},
+    scales:{
+      x:{ title:{display:true,text:'导线长度 (μm)',font:{size:11}}, ticks:{maxTicksLimit:8,font:{size:10}}, grid:{color:'rgba(128,128,128,0.08)'} },
+      y:{ title:{display:true,text:'延迟 τ',font:{size:11}}, ticks:{font:{size:10}, callback:v=>fmtT(v)}, grid:{color:'rgba(128,128,128,0.08)'} }
+    },
+    animation:{ duration:150 }
+  }
+});
+
+let cursorLine = null;
+
+function update() {
+  const L = parseInt(document.getElementById('len-slider').value);
+  document.getElementById('len-out').textContent = L+' μm';
+  document.getElementById('wire-bar').style.width = (L/200*100)+'%';
+  
+  const {R,C,tau} = calcRC(L, curTech);
+  document.getElementById('r-val').innerHTML = fmtR(R)+'';
+  document.getElementById('c-val').innerHTML = fmtC(C)+'';
+  document.getElementById('tau-val').innerHTML = fmtT(tau)+'';
+  
+  const tau1 = calcRC(1, curTech).tau;
+  const tau10 = calcRC(10, curTech).tau;
+  const tauL = calcRC(L, curTech).tau;
+  const ratio = Math.round(tauL / calcRC(Math.max(1,Math.round(L/10)), curTech).tau);
+  document.getElementById('insight-text').textContent =
+    `当前节点(${TECH[curTech].label})，导线 ${L}μm: τ = ${fmtT(tauL)}。长度×10 → 延迟×100（平方律验证）`;
+
+  const tauData = labels.map(l => calcRC(l, curTech).tau);
+  const linRef = labels.map(l => tau1 * l);
+  chart.data.datasets[0].data = tauData;
+  chart.data.datasets[1].data = linRef;
+  chart.update('none');
+}
+
+function setTech(t) {
+  curTech = t;
+  document.querySelectorAll('.tech-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-'+t).classList.add('active');
+  update();
+}
+
+update();
+</script>

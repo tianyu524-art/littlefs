@@ -1,0 +1,174 @@
+
+<h2 class="sr-only">Cache 可靠性设计：SECDED ECC 原理、SRAM 失效模式、MCA 错误处理流程与软件隔离机制</h2>
+<style>
+.sec { margin:0 0 14px; }
+.sec-title { font-size:13px; font-weight:500; color:var(--color-text-primary); margin:0 0 6px; border-bottom:0.5px solid var(--color-border-tertiary); padding-bottom:4px; }
+.ecc-row { display:flex; gap:3px; margin:6px 0; flex-wrap:wrap; }
+.bit-b { width:22px; height:22px; border-radius:3px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:500; border:0.5px solid; flex-shrink:0; }
+.bit-b.data { background:var(--color-background-info); border-color:var(--color-border-info); color:var(--color-text-info); }
+.bit-b.par { background:#BA751722; border-color:#BA7517; color:#633806; }
+.bit-b.ded { background:#7F77DD22; border-color:#7F77DD; color:#3C3489; }
+.bit-b.err { background:#E24B4A22; border-color:#E24B4A; color:#791F1F; animation: blink 0.8s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.flow { display:flex; flex-direction:column; gap:4px; }
+.flow-step { display:flex; align-items:center; gap:8px; font-size:12px; }
+.flow-box { padding:4px 10px; border-radius:4px; font-size:11px; font-weight:500; border:0.5px solid; white-space:nowrap; }
+.fb-hw { background:#1D9E7522; border-color:#1D9E75; color:#085041; }
+.fb-fw { background:#BA751722; border-color:#BA7517; color:#633806; }
+.fb-os { background:#7F77DD22; border-color:#7F77DD; color:#3C3489; }
+.fb-app { background:var(--color-background-secondary); border-color:var(--color-border-secondary); color:var(--color-text-secondary); }
+.arr-d { color:var(--color-text-tertiary); font-size:12px; }
+.fault-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.fault-card { background:var(--color-background-secondary); border-radius:6px; padding:8px; font-size:11px; border:0.5px solid var(--color-border-tertiary); }
+.fault-card b { font-size:12px; display:block; margin-bottom:4px; color:var(--color-text-primary); }
+</style>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+<div>
+<div class="sec">
+  <div class="sec-title">① SRAM 失效模式分类</div>
+  <div class="fault-grid">
+    <div class="fault-card"><b>Stuck-At 故障</b>位元永久固定为 0 或 1，制造缺陷或离子辐射损伤</div>
+    <div class="fault-card"><b>Transition 故障</b>单元可以保持状态但无法完成 0→1 或 1→0 切换</div>
+    <div class="fault-card"><b>Coupling 故障</b>相邻 bitline/wordline 之间的寄生耦合导致互相干扰</div>
+    <div class="fault-card"><b>BTI 老化</b>NBTI/PBTI 导致 Vth 漂移，弱单元随时间变慢直至失效</div>
+    <div class="fault-card"><b>软错误 (SEU)</b>Alpha 粒子/宇宙射线翻转单元，无永久损伤，可纠正</div>
+    <div class="fault-card"><b>保留故障</b>漏电流超标，6T SRAM 内部节点电荷泄漏翻转状态</div>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">② SECDED ECC 位布局（32b数据 + 7b校验）</div>
+  <div style="font-size:11px;color:var(--color-text-tertiary);margin-bottom:4px;">蓝=数据位，橙=Hamming校验位，紫=DED总体校验位</div>
+  <div class="ecc-row" id="ecc-row"></div>
+  <div style="font-size:11px;color:var(--color-text-secondary);margin:6px 0;">
+    位置规则：校验位 P<sub>i</sub> 位于 2<sup>i-1</sup> 处（P1=位1,P2=位2,P4=位4...）<br>
+    P1 = XOR(位1,3,5,7,9,11...)  P2 = XOR(位2,3,6,7,10,11...)<br>
+    综合征(syndrome)非零→单bit纠错，综合征+总体校验→双bit检测
+  </div>
+  <div style="font-size:11px;">
+    <button onclick="injectErr()" style="font-size:11px;padding:4px 10px;cursor:pointer;border-radius:4px;">注入单bit错误</button>
+    <button onclick="injectErr2()" style="font-size:11px;padding:4px 10px;cursor:pointer;border-radius:4px;margin-left:6px;">注入双bit错误</button>
+    <button onclick="clearErr()" style="font-size:11px;padding:4px 10px;cursor:pointer;border-radius:4px;margin-left:6px;">清除</button>
+  </div>
+  <div id="ecc-status" style="font-size:11px;margin-top:6px;padding:6px 8px;border-radius:4px;background:var(--color-background-secondary);min-height:32px;"></div>
+</div>
+</div>
+
+<div>
+<div class="sec">
+  <div class="sec-title">③ Cache line 硬件冗余：行/列替换</div>
+  <div style="font-size:11px;color:var(--color-text-secondary);line-height:1.7;">
+    与 DRAM 相同，SRAM 阵列具备冗余行/列（典型 L3：每个 bank 4冗余行 + 2冗余列）。<br>
+    <b>测试流程</b>：晶圆分选(Wafer Sort) → MBIST 识别坏行/列 → 激光熔断/eFuse 编程修复 → 量产筛选<br>
+    <b>在线修复</b>：AMD/Intel L3 支持运行时坏路禁用（减少关联度 16-way→14-way），避免整片 L3 失效
+  </div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">④ 错误处理软硬件协同流程</div>
+  <div class="flow">
+    <div class="flow-step"><div class="flow-box fb-hw">L3 ECC 电路检测1bit错误</div></div>
+    <div class="flow-step"><span class="arr-d">↓</span></div>
+    <div class="flow-step"><div class="flow-box fb-hw">硬件自动纠正，写回正确值</div><span style="font-size:10px;color:var(--color-text-tertiary)">无需软件</span></div>
+    <div class="flow-step"><span class="arr-d">↓ 累计阈值(CMCI)</span></div>
+    <div class="flow-step"><div class="flow-box fb-hw">触发 CMCI 中断 → MCE Bank记录</div></div>
+    <div class="flow-step"><span class="arr-d">↓</span></div>
+    <div class="flow-step"><div class="flow-box fb-fw">UEFI/BIOS: GHES ACPI报告</div></div>
+    <div class="flow-step"><span class="arr-d">↓</span></div>
+    <div class="flow-step"><div class="flow-box fb-os">OS MCE Handler: /dev/mcelog</div></div>
+    <div class="flow-step"><span class="arr-d">↓ 物理地址解析</span></div>
+    <div class="flow-step"><div class="flow-box fb-os">memory_failure() → hwpoison</div></div>
+    <div class="flow-step"><span class="arr-d">↓</span></div>
+    <div class="flow-step"><div class="flow-box fb-os">对应物理页设 PG_hwpoison</div></div>
+    <div class="flow-step"><span class="arr-d">↓</span></div>
+    <div class="flow-step"><div class="flow-box fb-app">应用收到 SIGBUS / 进程杀死</div></div>
+    <div class="flow-step"><span class="arr-d">↓ 如为文件页</span></div>
+    <div class="flow-step"><div class="flow-box fb-app">从磁盘重新读取(文件系统层恢复)</div></div>
+  </div>
+</div>
+</div>
+</div>
+
+<div style="margin-top:12px;" class="sec">
+<div class="sec-title">⑤ Cache 坏路软件隔离：x86 MCE MSR 接口详解</div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;">
+  <div style="background:var(--color-background-secondary);padding:8px;border-radius:6px;">
+    <b style="font-size:12px;display:block;margin-bottom:4px;">MCA Bank 寄存器</b>
+    IA32_MCi_STATUS[63]: VALID<br>
+    IA32_MCi_STATUS[62]: OVERFLOW<br>
+    IA32_MCi_STATUS[61]: UC(Uncorrected)<br>
+    IA32_MCi_STATUS[60]: EN(Enabled)<br>
+    IA32_MCi_STATUS[57]: S(Signaling)<br>
+    IA32_MCi_STATUS[56]: AR(Action Required)<br>
+    IA32_MCi_ADDR: 故障物理地址<br>
+    IA32_MCi_MISC: 恢复提示信息
+  </div>
+  <div style="background:var(--color-background-secondary);padding:8px;border-radius:6px;">
+    <b style="font-size:12px;display:block;margin-bottom:4px;">Cache 坏路禁用 (Intel)</b>
+    BIOS 可通过 MSR_CACHE_CONTROL<br>
+    写入坏路 bitmask 禁用特定 Way<br>
+    例：32MB L3 16-way<br>
+    禁用1路 → 30MB 有效容量<br>
+    OS 对此透明，不感知容量变化<br>
+    <br>
+    AMD 等效: FCH/SMU<br>
+    通过固件 AGESA 实现路掩码
+  </div>
+  <div style="background:var(--color-background-secondary);padding:8px;border-radius:6px;">
+    <b style="font-size:12px;display:block;margin-bottom:4px;">Linux 软件隔离流程</b>
+    1. mce_machine_check() IRQ<br>
+    2. mce_gather_info() 读MSR<br>
+    3. mce_severity() 分级<br>
+    4. memory_failure(pfn,...)<br>
+    5. invalidate_inode_page()<br>
+    6. hwpoison_walk_page_vmas()<br>
+    7. set_page_hwpoison_huge()<br>
+    8. num_poisoned_pages++ (sysfs)<br>
+    9. /proc/meminfo: HardwareCorrupted
+  </div>
+</div>
+</div>
+
+<script>
+const N = 39;
+const bits = Array(N).fill(0);
+const parityPos = [1,2,4,8,16,32];
+const dedPos = 0;
+
+function initECC() {
+  const row = document.getElementById('ecc-row');
+  row.innerHTML = '';
+  for(let i=0;i<N;i++){
+    const d = document.createElement('div');
+    d.className = 'bit-b ' + (i===0?'ded':parityPos.includes(i)?'par':'data');
+    d.id = 'eb'+i;
+    d.title = i===0?'总体DED校验':parityPos.includes(i)?`P${Math.log2(i)+1} 校验位`:`数据位${i}`;
+    d.textContent = '0';
+    row.appendChild(d);
+  }
+  clearStatus();
+}
+
+function injectErr() {
+  clearErr();
+  const pos = 5 + Math.floor(Math.random()*20);
+  document.getElementById('eb'+pos).classList.add('err');
+  document.getElementById('eb'+pos).textContent = '1';
+  document.getElementById('ecc-status').innerHTML = `<span style="color:#1D9E75">✓ 单bit错误已注入(位${pos}) → 综合征非零 → ECC硬件自动纠正 → 写回正确值 → 如计数超阈值触发CMCI</span>`;
+}
+
+function injectErr2() {
+  clearErr();
+  const p1=7,p2=13;
+  [p1,p2].forEach(p=>{ document.getElementById('eb'+p).classList.add('err'); document.getElementById('eb'+p).textContent='1'; });
+  document.getElementById('ecc-status').innerHTML = `<span style="color:#E24B4A">✗ 双bit错误已注入(位${p1},${p2}) → SECDED检测到 → 无法纠正 → UC bit置位 → 触发MCE → 系统处理</span>`;
+}
+
+function clearErr() {
+  for(let i=0;i<N;i++){ const e=document.getElementById('eb'+i); if(e){e.classList.remove('err');e.textContent='0';} }
+  clearStatus();
+}
+function clearStatus(){document.getElementById('ecc-status').innerHTML='<span style="color:var(--color-text-tertiary)">点击按钮注入错误，观察 ECC 检测和纠正行为</span>';}
+initECC();
+</script>

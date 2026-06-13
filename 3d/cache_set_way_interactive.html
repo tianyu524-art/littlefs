@@ -1,0 +1,171 @@
+
+<h2 class="sr-only">交互式 Cache 地址分解与 Set/Way 组织结构：调节参数观察 Tag/Index/Offset 位宽和阵列布局变化</h2>
+<style>
+.cfg { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; align-items:center; font-size:13px; color:var(--color-text-secondary); }
+.cfg label { display:flex; align-items:center; gap:6px; }
+.bit-row { display:flex; height:36px; border-radius:6px; overflow:hidden; font-size:12px; font-weight:500; margin-bottom:8px; border:0.5px solid var(--color-border-tertiary); }
+.bit-seg { display:flex; align-items:center; justify-content:center; height:100%; transition:width .3s; }
+.bit-seg.tag { background:#7F77DD22; border-right:1px solid #7F77DD55; color:#3C3489; }
+.bit-seg.idx { background:#1D9E7522; border-right:1px solid #1D9E7555; color:#085041; }
+.bit-seg.off { background:#BA751722; color:#633806; }
+.bit-lab { display:flex; font-size:11px; color:var(--color-text-tertiary); margin-bottom:14px; }
+.bit-lab span { text-align:center; transition:width .3s; }
+.grid { display:grid; gap:6px; margin:12px 0; }
+.set-row { display:flex; gap:4px; align-items:center; }
+.set-num { font-size:11px; color:var(--color-text-tertiary); min-width:32px; text-align:right; }
+.way-cell { height:22px; border-radius:4px; border:0.5px solid var(--color-border-tertiary); font-size:10px; display:flex; align-items:center; justify-content:center; transition:background .2s; cursor:default; flex:1; }
+.way-cell.hit { background:#1D9E7533; border-color:#1D9E75; }
+.way-cell.dirty { background:#BA751733; border-color:#BA7517; }
+.way-cell.lru { background:#7F77DD22; border-color:#7F77DD55; }
+.way-cell.invalid { background:var(--color-background-secondary); color:var(--color-text-tertiary); }
+.stat-row { display:flex; gap:12px; flex-wrap:wrap; margin:10px 0; }
+.stat { font-size:12px; background:var(--color-background-secondary); padding:6px 10px; border-radius:6px; }
+.stat b { font-weight:500; }
+.legend { display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--color-text-secondary); margin:8px 0; }
+.legend span { display:flex; align-items:center; gap:4px; }
+.leg-dot { width:10px; height:10px; border-radius:2px; }
+</style>
+
+<div class="cfg">
+  <label>缓存大小
+    <select id="sz" onchange="recalc()">
+      <option value="16384">L1 16KB</option>
+      <option value="32768" selected>L1 32KB</option>
+      <option value="262144">L2 256KB</option>
+      <option value="1048576">L2 1MB</option>
+    </select>
+  </label>
+  <label>路数(Way)
+    <select id="ways" onchange="recalc()">
+      <option value="2">2-way</option>
+      <option value="4">4-way</option>
+      <option value="8" selected>8-way</option>
+      <option value="16">16-way</option>
+    </select>
+  </label>
+  <label>行大小
+    <select id="lsz" onchange="recalc()">
+      <option value="32">32B</option>
+      <option value="64" selected>64B</option>
+      <option value="128">128B</option>
+    </select>
+  </label>
+  <label>替换策略
+    <select id="pol" onchange="recalc()">
+      <option value="plru">PLRU</option>
+      <option value="lru">真LRU</option>
+      <option value="rrip">RRIP(2bit)</option>
+      <option value="rand">随机</option>
+    </select>
+  </label>
+</div>
+
+<div class="bit-row" id="bit-bar"></div>
+<div class="bit-lab" id="bit-lab"></div>
+
+<div class="stat-row" id="stats"></div>
+
+<div style="font-size:12px;color:var(--color-text-secondary);margin:6px 0 4px;">Tag RAM 结构 (每组每路一个 entry)：</div>
+<div style="font-size:11px;background:var(--color-background-secondary);padding:8px 10px;border-radius:6px;font-family:var(--font-mono);line-height:1.7;color:var(--color-text-primary);" id="tag-entry"></div>
+
+<div style="font-size:12px;color:var(--color-text-secondary);margin:12px 0 4px;">Set/Way 阵列状态 (前 <span id="show-sets">16</span> 组，模拟随机访问)：</div>
+<div class="legend">
+  <span><span class="leg-dot" style="background:#1D9E7533;border:0.5px solid #1D9E75;"></span>命中/有效</span>
+  <span><span class="leg-dot" style="background:#BA751733;border:0.5px solid #BA7517;"></span>脏(Dirty)</span>
+  <span><span class="leg-dot" style="background:#7F77DD22;border:0.5px solid #7F77DD55;"></span>LRU候选</span>
+  <span><span class="leg-dot" style="background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);"></span>无效</span>
+</div>
+<div id="array-grid"></div>
+
+<div style="font-size:12px;color:var(--color-text-secondary);margin:10px 0 4px;">替换策略元数据占用（每组）：</div>
+<div style="font-size:11px;background:var(--color-background-secondary);padding:8px 10px;border-radius:6px;font-family:var(--font-mono);line-height:1.7;color:var(--color-text-primary);" id="repl-info"></div>
+
+<script>
+function recalc() {
+  const sz = parseInt(document.getElementById('sz').value);
+  const W = parseInt(document.getElementById('ways').value);
+  const L = parseInt(document.getElementById('lsz').value);
+  const pol = document.getElementById('pol').value;
+
+  const offBits = Math.log2(L);
+  const sets = sz / W / L;
+  const idxBits = Math.log2(sets);
+  const tagBits = 64 - offBits - idxBits;
+  const totalBits = 64;
+
+  const offW = (offBits/totalBits*100).toFixed(1);
+  const idxW = (idxBits/totalBits*100).toFixed(1);
+  const tagW = (tagBits/totalBits*100).toFixed(1);
+
+  document.getElementById('bit-bar').innerHTML = `
+    <div class="bit-seg tag" style="width:${tagW}%">Tag[${tagBits}b]</div>
+    <div class="bit-seg idx" style="width:${idxW}%">Index[${idxBits}b]</div>
+    <div class="bit-seg off" style="width:${offW}%">Offset[${offBits}b]</div>`;
+
+  document.getElementById('bit-lab').innerHTML = `
+    <span style="width:${tagW}%;font-size:10px">位[63:${offBits+idxBits}]</span>
+    <span style="width:${idxW}%;font-size:10px">位[${offBits+idxBits-1}:${offBits}]</span>
+    <span style="width:${offW}%;font-size:10px">位[${offBits-1}:0]</span>`;
+
+  // Tag entry structure
+  const mesiB = 2;
+  const dirtyB = 1;
+  const validB = 1;
+  const eccB = 8;
+  const totalEntry = tagBits + mesiB + dirtyB + validB + eccB;
+  document.getElementById('tag-entry').innerHTML =
+    `[V(1)] [D(1)] [MESI(2)] [ECC(${eccB})] [Tag(${tagBits})]  = ${totalEntry} bits/entry
+每组总计: ${totalEntry} × ${W} ways = ${totalEntry*W} bits
+全阵列 Tag RAM: ${(totalEntry*W*sets/8/1024).toFixed(1)} KB`;
+
+  // Replacement metadata
+  let replDesc = '';
+  let replBits = 0;
+  if (pol === 'lru') {
+    replBits = Math.ceil(Math.log2(fact(W)));
+    replDesc = `真LRU 需要 log₂(${W}!) ≈ ${replBits} bits/组 (记录所有路的完整访问顺序)\n存储结构: 排列矩阵或栈 — 开销大，仅用于小路数`;
+  } else if (pol === 'plru') {
+    replBits = W - 1;
+    replDesc = `PLRU 二叉树: ${W}路 需要 ${W}-1 = ${replBits} bits/组\n每个内部节点1bit，指向LRU方向\n硬件实现: ${replBits}个触发器/组，面积仅为真LRU的${(replBits*100/Math.ceil(Math.log2(fact(W)))).toFixed(0)}%\n精度略低但工程上广泛采用 (ARM Cortex-A/x86 L2)`;
+  } else if (pol === 'rrip') {
+    replBits = 2 * W;
+    replDesc = `RRIP: 每路2bit RRPV (Re-Reference Prediction Value)\n总计 ${replBits} bits/组 — RRPV=3表示"远期被访问"(替换候选)\nSRRIP/BRRIP/DRRIP 变体抗扫描攻击，Intel L3使用DRRIP`;
+  } else {
+    replBits = 0;
+    replDesc = `随机替换: 0 bits元数据，用LFSR生成随机路号\n优点: 零面积开销，无thrashing\n缺点: 最坏情况下命中率最低\n部分ARM Cortex-A53采用`;
+  }
+  const replTotal = (replBits * sets / 8 / 1024).toFixed(2);
+  document.getElementById('repl-info').innerHTML = replDesc + `\n\n全阵列替换元数据: ${replBits} × ${sets} 组 = ${(replBits*sets).toLocaleString()} bits = ${replTotal} KB`;
+
+  // Stats
+  document.getElementById('stats').innerHTML = `
+    <div class="stat">组数(Sets): <b>${sets}</b></div>
+    <div class="stat">路数(Ways): <b>${W}</b></div>
+    <div class="stat">行大小: <b>${L}B</b></div>
+    <div class="stat">Tag宽度: <b>${tagBits}b</b></div>
+    <div class="stat">Index宽度: <b>${idxBits}b</b></div>
+    <div class="stat">Offset宽度: <b>${offBits}b</b></div>
+    <div class="stat">Data RAM: <b>${(sz/1024).toFixed(0)}KB</b></div>
+    <div class="stat">MSHRs典型: <b>${W<=4?'8':'16-20'}</b></div>`;
+
+  // Array visualization
+  const showSets = Math.min(16, sets);
+  document.getElementById('show-sets').textContent = showSets;
+  const states = ['hit','dirty','lru','invalid'];
+  let rows = '';
+  for (let s = 0; s < showSets; s++) {
+    let cells = '';
+    for (let w = 0; w < W; w++) {
+      const r = Math.random();
+      const st = r < 0.35 ? 'hit' : r < 0.5 ? 'dirty' : r < 0.65 ? 'lru' : 'invalid';
+      const label = st === 'invalid' ? '---' : `W${w}`;
+      cells += `<div class="way-cell ${st}" title="Set${s} Way${w}: ${st.toUpperCase()}">${label}</div>`;
+    }
+    rows += `<div class="set-row"><span class="set-num">S${s}</span>${cells}</div>`;
+  }
+  document.getElementById('array-grid').innerHTML = rows;
+}
+
+function fact(n) { let r=1; for(let i=2;i<=n;i++) r*=i; return r; }
+recalc();
+</script>

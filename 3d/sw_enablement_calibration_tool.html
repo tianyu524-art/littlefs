@@ -1,0 +1,248 @@
+
+<h2 class="sr-only">软硬件协同使能系数交互式校准工具：按负载类型切换查看各优化维度的实际可信区间与原始表格对比</h2>
+<style>
+.wl-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.wl-tab{padding:5px 14px;border-radius:20px;font-size:12px;border:0.5px solid var(--color-border-secondary);cursor:pointer;color:var(--color-text-secondary);transition:all .15s}
+.wl-tab.on{background:var(--color-background-info);border-color:var(--color-border-info);color:var(--color-text-info);font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px}
+th{font-weight:500;font-size:11px;color:var(--color-text-secondary);padding:6px 8px;border-bottom:0.5px solid var(--color-border-secondary);text-align:left;white-space:nowrap}
+td{padding:6px 8px;border-bottom:0.5px solid var(--color-border-tertiary);vertical-align:middle}
+.bar-wrap{display:flex;align-items:center;gap:6px;min-width:120px}
+.bar-bg{flex:1;height:8px;background:var(--color-background-secondary);border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;transition:width .4s}
+.verdict{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:500}
+.v-ok{background:#1D9E7522;color:#085041;border:0.5px solid #1D9E75}
+.v-warn{background:#BA751722;color:#633806;border:0.5px solid #BA7517}
+.v-bad{background:#E24B4A22;color:#791F1F;border:0.5px solid #E24B4A}
+.amd-row{background:var(--color-background-secondary)}
+.note-box{background:var(--color-background-secondary);border-left:3px solid;border-radius:0 6px 6px 0;padding:8px 12px;margin:10px 0;font-size:12px;line-height:1.6;color:var(--color-text-secondary)}
+.stat-row{display:flex;gap:10px;margin:10px 0;flex-wrap:wrap}
+.stat-card{flex:1;min-width:120px;background:var(--color-background-secondary);border-radius:8px;padding:8px 12px}
+.stat-card .lbl{font-size:11px;color:var(--color-text-tertiary);margin-bottom:2px}
+.stat-card .val{font-size:18px;font-weight:500}
+.delta{font-size:11px;color:var(--color-text-tertiary)}
+</style>
+
+<div class="wl-tabs">
+  <div class="wl-tab on" onclick="setWL(0)">游戏 (7800X3D)</div>
+  <div class="wl-tab" onclick="setWL(1)">AI推理 (MI300X)</div>
+  <div class="wl-tab" onclick="setWL(2)">HPC/CFD (EPYC-X)</div>
+  <div class="wl-tab" onclick="setWL(3)">数据库 OLTP</div>
+  <div class="wl-tab" onclick="setWL(4)">双CCD调度 (9950X3D)</div>
+</div>
+
+<div id="wl-desc" class="note-box" style="border-color:#185FA5"></div>
+<div class="stat-row" id="stat-row"></div>
+
+<table id="main-table">
+<thead>
+<tr>
+  <th style="min-width:120px">优化维度</th>
+  <th>原表基线</th>
+  <th>原表优化后</th>
+  <th>原表倍数</th>
+  <th style="min-width:90px">校准基线</th>
+  <th style="min-width:90px">校准上限</th>
+  <th style="min-width:60px">可信度</th>
+  <th>主要依据</th>
+</tr>
+</thead>
+<tbody id="tbl-body"></tbody>
+</table>
+
+<div style="font-size:12px;font-weight:500;margin:8px 0 4px;color:var(--color-text-primary)">Amdahl 定律硬约束校验</div>
+<div style="position:relative;height:200px"><canvas id="amdChart" role="img" aria-label="Amdahl定律约束下3D缓存最大性能提升上限曲线">Amdahl定律约束图表</canvas></div>
+<div style="font-size:11px;color:var(--color-text-tertiary);margin-top:4px" id="amd-note"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const WL = [
+  {
+    name:"游戏 (7800X3D)",color:"#185FA5",
+    desc:"单CCD设计，不存在跨CCD调度问题；负载以渲染线程为主，缓存敏感但非带宽极限。V-Cache直接将L3从32MB扩展至96MB，OS无需感知即可获益。",
+    cacheP:0.35, memBW_ratio:0.95,
+    rows:[
+      {name:"3D拓扑感知调度", orig:[0.30,0.85,2.8], cal:[0.80,0.88,"1.1×"], v:"warn",
+       reason:"7800X3D单CCD，拓扑感知无意义。对9950X3D双CCD原表最接近，但0.30基线仍过低，随机调度给~0.65基线"},
+      {name:"统一内存管理", orig:[0.20,0.90,4.5], cal:["N/A","N/A","—"], v:"bad",
+       reason:"游戏场景无统一内存架构，DDR5是唯一内存，此维度不适用"},
+      {name:"热感知调度", orig:[0.50,0.88,1.8], cal:[0.82,0.90,"1.1×"], v:"warn",
+       reason:"桌面游戏热节流罕见，V-Cache底部堆叠后散热改善，基线应为0.80+而非0.50"},
+      {name:"运行时零拷贝", orig:[0.25,0.85,3.4], cal:["N/A","N/A","—"], v:"bad",
+       reason:"CPU游戏不涉及GPU-CPU数据搬运，此维度不适用"},
+      {name:"编译器3D优化", orig:[0.60,0.92,1.5], cal:[0.85,0.92,"1.08×"], v:"warn",
+       reason:"游戏引擎多为PGO优化的二进制，编译器对L3大小不建模，实测收益5-12%而非50%"},
+      {name:"综合效果", orig:[0.15,0.82,5.5], cal:[0.70,0.85,"1.2×"], v:"bad",
+       reason:"实测7800X3D游戏提升15-35%，对应基线0.65-0.80，综合系数~1.2-1.5×，5.5×严重高估"},
+    ]
+  },
+  {
+    name:"AI推理 (MI300X)",color:"#854F0B",
+    desc:"MI300X统一内存192GB HBM3，带宽3.5TB/s。LLM推理高度带宽受限，软件栈（ROCm/vLLM/llama.cpp）对UMA的适配深度直接决定性能。",
+    cacheP:0.85, memBW_ratio:0.20,
+    rows:[
+      {name:"3D拓扑感知调度", orig:[0.30,0.85,2.8], cal:[0.55,0.75,"1.4×"], v:"warn",
+       reason:"多CCD/多GCD调度影响NPS模式选择，但权重低于内存管理，1.4×合理"},
+      {name:"统一内存管理", orig:[0.20,0.90,4.5], cal:[0.18,0.85,"4.7×"], v:"ok",
+       reason:"最可信行。PCIe传输64GB/s vs HBM3 3.5TB/s，差距54×，但实际受计算比稀释，4-5×有据可查"},
+      {name:"热感知调度", orig:[0.50,0.88,1.8], cal:[0.60,0.85,"1.4×"], v:"ok",
+       reason:"HBM3高功耗下热管理重要，1.4×合理；基线0.50偏低应为0.60"},
+      {name:"运行时零拷贝", orig:[0.25,0.85,3.4], cal:[0.20,0.88,"4.4×"], v:"ok",
+       reason:"最可信行之一。LLM推理传统需要多次拷贝，UMA零拷贝消除后收益3-5×实测可复现"},
+      {name:"编译器3D优化", orig:[0.60,0.92,1.5], cal:[0.55,0.80,"1.45×"], v:"ok",
+       reason:"triton/MLIR对HBM tile大小感知明确，1.5×在AI场景接近真实"},
+      {name:"综合效果", orig:[0.15,0.82,5.5], cal:[0.12,0.82,"6.8×"], v:"ok",
+       reason:"AI推理是最接近原表假设的场景。无优化SW的MI300X可能仅用到16%峰值带宽，全栈优化后可达80%+"},
+    ]
+  },
+  {
+    name:"HPC/CFD (EPYC-X)",color:"#0F6E56",
+    desc:"EPYC Genoa-X每CCD 96MB L3。CFD求解器（OpenFOAM/Fluent）以大规模稀疏矩阵操作为主，内存带宽受限，V-Cache减少LLC miss是主要收益来源。",
+    cacheP:0.65, memBW_ratio:0.45,
+    rows:[
+      {name:"3D拓扑感知调度", orig:[0.30,0.85,2.8], cal:[0.55,0.80,"1.45×"], v:"warn",
+       reason:"EPYC-X有8个CCD，NPS模式和NUMA拓扑感知对MPI进程绑定影响显著，但原表基线0.30过低"},
+      {name:"统一内存管理", orig:[0.20,0.90,4.5], cal:[0.50,0.82,"1.64×"], v:"warn",
+       reason:"HPC用DDR5+HBM2e（部分SKU），不是统一内存，此优化收益有限"},
+      {name:"热感知调度", orig:[0.50,0.88,1.8], cal:[0.65,0.88,"1.35×"], v:"ok",
+       reason:"服务器持续高负载热节流真实存在，1.35×对服务器场景合理"},
+      {name:"运行时零拷贝", orig:[0.25,0.85,3.4], cal:[0.60,0.78,"1.3×"], v:"warn",
+       reason:"HPC数据主要在CPU端，无GPU-CPU频繁拷贝，此优化收益低"},
+      {name:"编译器3D优化", orig:[0.60,0.92,1.5], cal:[0.65,0.90,"1.38×"], v:"ok",
+       reason:"HPC代码可重编译，tiling/prefetch针对大L3优化效果明显，实测+10-30%"},
+      {name:"综合效果", orig:[0.15,0.82,5.5], cal:[0.38,0.80,"2.1×"], v:"warn",
+       reason:"Phoronix实测Genoa-X vs Genoa: +47-52%，对应综合提升约2×，而非5.5×"},
+    ]
+  },
+  {
+    name:"数据库 OLTP",color:"#534AB7",
+    desc:"MySQL/PostgreSQL等OLTP负载，热点数据集通常50-150MB，V-Cache的96MB L3能承载大部分热页面，Buffer Pool命中率是关键指标。",
+    cacheP:0.55, memBW_ratio:0.60,
+    rows:[
+      {name:"3D拓扑感知调度", orig:[0.30,0.85,2.8], cal:[0.60,0.82,"1.37×"], v:"warn",
+       reason:"OLTP多线程绑核非常关键，但随机调度基线0.60更合理而非0.30"},
+      {name:"统一内存管理", orig:[0.20,0.90,4.5], cal:[0.55,0.82,"1.49×"], v:"warn",
+       reason:"数据库Buffer Pool管理已是成熟技术，"未优化"基线比原表高得多"},
+      {name:"热感知调度", orig:[0.50,0.88,1.8], cal:[0.70,0.88,"1.26×"], v:"ok",
+       reason:"数据库服务器24/7持续负载，热管理重要，1.26×符合预期"},
+      {name:"运行时零拷贝", orig:[0.25,0.85,3.4], cal:[0.65,0.82,"1.26×"], v:"warn",
+       reason:"数据库内核路径已经高度优化减少拷贝，此维度提升有限"},
+      {name:"编译器3D优化", orig:[0.60,0.92,1.5], cal:[0.70,0.88,"1.26×"], v:"ok",
+       reason:"PostgreSQL等支持PGO，但L3感知有限，实测DB场景+10-20%"},
+      {name:"综合效果", orig:[0.15,0.82,5.5], cal:[0.42,0.78,"1.86×"], v:"warn",
+       reason:"AMD EPYC Milan-X实测数据库场景+22-50%，综合约1.8-2×，非5.5×"},
+    ]
+  },
+  {
+    name:"双CCD调度 (9950X3D)",color:"#993C1D",
+    desc:"9950X3D双CCD，CCD0 96MB V-Cache，CCD1 32MB标准L3，跨CCD延迟75-80ns。游戏线程必须在CCD0运行才能利用V-Cache，OS调度是核心瓶颈。",
+    cacheP:0.40, memBW_ratio:0.85,
+    rows:[
+      {name:"3D拓扑感知调度", orig:[0.30,0.85,2.8], cal:[0.50,0.82,"1.64×"], v:"ok",
+       reason:"最适用场景。无感知时线程在CCD1运行游戏，完全错过V-Cache，但基线0.50更准确（不是0.30）"},
+      {name:"统一内存管理", orig:[0.20,0.90,4.5], cal:["N/A","N/A","—"], v:"bad",
+       reason:"消费级双通道DDR5，无统一内存架构，不适用"},
+      {name:"热感知调度", orig:[0.50,0.88,1.8], cal:[0.72,0.88,"1.22×"], v:"warn",
+       reason:"9950X3D热设计改善，节流不严重，1.2×是更真实的热管理收益"},
+      {name:"运行时零拷贝", orig:[0.25,0.85,3.4], cal:["N/A","N/A","—"], v:"bad",
+       reason:"CPU游戏无GPU大量数据搬运，不适用"},
+      {name:"编译器3D优化", orig:[0.60,0.92,1.5], cal:[0.82,0.90,"1.10×"], v:"warn",
+       reason:"游戏二进制已优化，编译器对此场景边际收益有限"},
+      {name:"综合效果", orig:[0.15,0.82,5.5], cal:[0.55,0.82,"1.49×"], v:"warn",
+       reason:"实测9950X3D vs 9950X游戏提升~20-30%，正确调度使能后约1.3-1.5×，非5.5×"},
+    ]
+  }
+];
+
+let curWL = 0, amdChart = null;
+
+function setWL(i) {
+  curWL = i;
+  document.querySelectorAll('.wl-tab').forEach((t,j)=>t.classList.toggle('on',i===j));
+  render();
+}
+
+function render() {
+  const wl = WL[curWL];
+  document.getElementById('wl-desc').innerHTML = wl.desc;
+  document.getElementById('wl-desc').style.borderColor = wl.color;
+
+  const validRows = wl.rows.filter(r => r.cal[0] !== 'N/A');
+  const calLow = validRows.length ? (validRows.reduce((a,r)=>a*r.cal[0],1)**(1/validRows.length)).toFixed(2) : 'N/A';
+  const calHigh = validRows.length ? (validRows.reduce((a,r)=>a*r.cal[1],1)**(1/validRows.length)).toFixed(2) : 'N/A';
+  const maxGain = (1/((1-wl.cacheP)+wl.cacheP/6)).toFixed(2);
+
+  document.getElementById('stat-row').innerHTML = `
+    <div class="stat-card"><div class="lbl">缓存受限比例(P)</div><div class="val">${(wl.cacheP*100).toFixed(0)}%</div><div class="delta">Amdahl 约束来源</div></div>
+    <div class="stat-card"><div class="lbl">理论最大加速</div><div class="val">${maxGain}×</div><div class="delta">假设LLC Miss清零</div></div>
+    <div class="stat-card"><div class="lbl">校准综合基线</div><div class="val">${calLow}</div><div class="delta">vs 原表 0.15</div></div>
+    <div class="stat-card"><div class="lbl">校准综合上限</div><div class="val">${calHigh}</div><div class="delta">vs 原表 0.82</div></div>
+    <div class="stat-card"><div class="lbl">原表综合倍数</div><div class="val" style="color:#E24B4A">5.5×</div><div class="delta">Amdahl上限${maxGain}×约束</div></div>`;
+
+  const tbody = document.getElementById('tbl-body');
+  tbody.innerHTML = '';
+  wl.rows.forEach(row => {
+    const na = row.cal[0] === 'N/A';
+    const vClass = {ok:'v-ok',warn:'v-warn',bad:'v-bad'}[row.v];
+    const vLabel = {ok:'合理',warn:'偏差',bad:'不适用'}[row.v];
+    const origRatio = row.orig[2].toFixed ? row.orig[2].toFixed(1)+'×' : row.orig[2];
+    const calRatio = na ? '—' : row.cal[2];
+    const calLowVal = na ? '—' : row.cal[0].toFixed(2);
+    const calHighVal = na ? '—' : row.cal[1].toFixed(2);
+    const barW = na ? 0 : Math.round(row.cal[1]*100);
+    const barW0 = na ? 0 : Math.round(row.cal[0]*100);
+    tbody.innerHTML += `<tr>
+      <td style="font-weight:500">${row.name}</td>
+      <td>${row.orig[0]}</td><td>${row.orig[1]}</td><td>${origRatio}</td>
+      <td>${na?'—':`<div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${barW0}%;background:${wl.color}55"></div></div><span>${calLowVal}</span></div>`}</td>
+      <td>${na?'—':`<div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${barW}%;background:${wl.color}"></div></div><span>${calHighVal}</span></div>`}</td>
+      <td><span class="verdict ${vClass}">${vLabel}</span></td>
+      <td style="font-size:11px;color:var(--color-text-tertiary)">${row.reason}</td>
+    </tr>`;
+  });
+
+  updateAmd(wl);
+}
+
+function updateAmd(wl) {
+  const P = wl.cacheP;
+  const speedups = [1,1.5,2,3,5,8,10,20,50];
+  const maxGains = speedups.map(s => 1/((1-P)+P/s));
+
+  if(amdChart) amdChart.destroy();
+  amdChart = new Chart(document.getElementById('amdChart'), {
+    type:'line',
+    data:{
+      labels: speedups.map(s=>s+'×'),
+      datasets:[{
+        label:'最大系统加速比',
+        data: maxGains,
+        borderColor: WL[curWL].color,
+        backgroundColor: WL[curWL].color+'22',
+        fill:true, tension:0.4, pointRadius:4,
+        borderWidth:2
+      },{
+        label:'原表5.5×声明',
+        data: Array(speedups.length).fill(5.5),
+        borderColor:'#E24B4A', borderDash:[5,4], borderWidth:1.5, pointRadius:0, fill:false,
+        label:'原表5.5×声明'
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{
+        legend:{display:false},
+        tooltip:{callbacks:{label:ctx=>`系统加速比: ${ctx.raw.toFixed(2)}×`}}
+      },
+      scales:{
+        x:{title:{display:true,text:'LLC Miss Rate 改善倍数',font:{size:11}},ticks:{font:{size:10}}},
+        y:{title:{display:true,text:'端到端系统加速比',font:{size:11}},ticks:{font:{size:10},callback:v=>v.toFixed(1)+'×'},min:1}
+      }
+    }
+  });
+  document.getElementById('amd-note').textContent =
+    `当前场景缓存受限比例 P=${(P*100).toFixed(0)}%，即使 LLC Miss 完全消除，理论最大加速比仅为 ${(1/(1-P)).toFixed(2)}× ——原表 5.5× 超过此 Amdahl 上限，物理上不可能实现。`;
+}
+
+render();
+</script>
